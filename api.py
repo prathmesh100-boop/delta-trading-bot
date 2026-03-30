@@ -304,6 +304,15 @@ class DeltaRESTClient:
         if lots < min_size and lots > 0:
             lots = min_size
 
+        # If we got 0 lots but usd_notional > 0, ensure we place at least 1 lot
+        # This happens when capital is small relative to price, but leverage allows it
+        if lots == 0 and usd_notional > 0:
+            lots = 1
+            logger.info(
+                "usd_to_lots: Adjusted from 0 → 1 lot (symbol=%s, usd=%.2f, price=%.4f)",
+                symbol, usd_notional, price,
+            )
+
         logger.debug(
             "usd_to_lots: symbol=%s usd=%.2f price=%.4f contract_value=%s → %d lots",
             symbol, usd_notional, price, contract_value, lots,
