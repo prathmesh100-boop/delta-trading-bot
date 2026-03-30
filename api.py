@@ -20,7 +20,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 try:
     import aiohttp
@@ -318,13 +318,39 @@ class DeltaRESTClient:
     async def get_ohlcv(
         self,
         symbol: str,
-        resolution: int,          # minutes: 1, 5, 15, 60, 240, 1440
+        resolution: Union[int, str],          # minutes (int) or API string like '15m', '1h'
         start: int,               # unix timestamp (seconds)
         end: int,
     ) -> List[OHLCV]:
+        # Delta API expects a resolution string like '1m','15m','1h','1d', etc.
+        # Accept ints (minutes) for callers and convert to the proper string.
+        allowed_map = {
+            1: "1m",
+            3: "3m",
+            5: "5m",
+            15: "15m",
+            30: "30m",
+            60: "1h",
+            120: "2h",
+            240: "4h",
+            360: "6h",
+            720: "12h",
+            1440: "1d",
+            10080: "1w",
+        }
+
+        if isinstance(resolution, int):
+            if resolution not in allowed_map:
+                raise ValueError(
+                    f"Unsupported numeric resolution {resolution!r}. Allowed minutes: {list(allowed_map.keys())}"
+                )
+            res_str = allowed_map[resolution]
+        else:
+            res_str = str(resolution)
+
         params = {
             "symbol": symbol,
-            "resolution": resolution,
+            "resolution": res_str,
             "start": start,
             "end": end,
         }
