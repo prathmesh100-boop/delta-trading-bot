@@ -42,6 +42,11 @@ class RiskConfig:
 
     # Trailing stop
     trailing_stop_pct: float = 0.02       # 2% from peak
+    # Breakeven / profit lock
+    breakeven_trigger_pct: float = 0.005  # when profit reaches 0.5% move stop to breakeven
+    breakeven_buffer: float = 0.0         # optional small buffer above entry when moving to breakeven
+    profit_lock_threshold_pct: float = 0.01  # when profit reaches 1% enable profit lock
+    profit_lock_pct: float = 0.005        # lock at peak*(1 - profit_lock_pct) (for long)
 
     # Fees (for PnL estimation)
     maker_fee: float = 0.0002
@@ -64,6 +69,7 @@ class TradeRecord:
     entry_time: datetime
     trailing_stop_price: Optional[float] = None
     peak_price: Optional[float] = None
+    breakeven_activated: bool = False
     order_id: Optional[str] = None
     realised_pnl: float = 0.0
     closed: bool = False
@@ -201,18 +207,70 @@ class RiskManager:
             if trade.side == "long":
                 trade.peak_price = max(trade.peak_price or trade.entry_price, current_price)
                 new_trail = trade.peak_price * (1 - self.cfg.trailing_stop_pct)
+                updated = False
                 if trade.trailing_stop_price is None or new_trail > trade.trailing_stop_price:
                     trade.trailing_stop_price = new_trail
                     logger.debug("Trail stop updated: %s long → %.4f", symbol, new_trail)
-                    return new_trail
+                    updated = True
+
+                # Breakeven: once a small profit threshold is reached, move hard SL to entry (+buffer)
+                try:
+                    if (not trade.breakeven_activated) and self.cfg.breakeven_trigger_pct > 0:
+                        if trade.peak_price >= trade.entry_price * (1 + self.cfg.breakeven_trigger_pct):
+                            be_price = trade.entry_price + self.cfg.breakeven_buffer
+                            if be_price > trade.stop_loss:
+                                trade.stop_loss = be_price
+                                trade.breakeven_activated = True
+                                logger.info("Breakeven activated: %s long stop -> %.4f", symbol, be_price)
+                except Exception:
+                    pass
+
+                # Profit-lock: tighten hard stop based on peak once a larger threshold is reached
+                try:
+                    if self.cfg.profit_lock_threshold_pct > 0 and trade.peak_price >= trade.entry_price * (1 + self.cfg.profit_lock_threshold_pct):
+                        lock_price = trade.peak_price * (1 - self.cfg.profit_lock_pct)
+                        if lock_price > trade.stop_loss:
+                            trade.stop_loss = lock_price
+                            logger.info("Profit lock applied: %s long stop -> %.4f", symbol, lock_price)
+                except Exception:
+                    pass
+
+                if updated:
+                    return trade.trailing_stop_price
 
             elif trade.side == "short":
                 trade.peak_price = min(trade.peak_price or trade.entry_price, current_price)
                 new_trail = trade.peak_price * (1 + self.cfg.trailing_stop_pct)
+                updated = False
                 if trade.trailing_stop_price is None or new_trail < trade.trailing_stop_price:
                     trade.trailing_stop_price = new_trail
                     logger.debug("Trail stop updated: %s short → %.4f", symbol, new_trail)
-                    return new_trail
+                    updated = True
+
+                # Breakeven for short: when price falls enough, move SL to entry - buffer
+                try:
+                    if (not trade.breakeven_activated) and self.cfg.breakeven_trigger_pct > 0:
+                        if trade.peak_price <= trade.entry_price * (1 - self.cfg.breakeven_trigger_pct):
+                            be_price = trade.entry_price - self.cfg.breakeven_buffer
+                            if be_price < trade.stop_loss:
+                                trade.stop_loss = be_price
+                                trade.breakeven_activated = True
+                                logger.info("Breakeven activated: %s short stop -> %.4f", symbol, be_price)
+                except Exception:
+                    pass
+
+                # Profit-lock for short: tighten SL towards peak when sufficient profit
+                try:
+                    if self.cfg.profit_lock_threshold_pct > 0 and trade.peak_price <= trade.entry_price * (1 - self.cfg.profit_lock_threshold_pct):
+                        lock_price = trade.peak_price * (1 + self.cfg.profit_lock_pct)
+                        if lock_price < trade.stop_loss:
+                            trade.stop_loss = lock_price
+                            logger.info("Profit lock applied: %s short stop -> %.4f", symbol, lock_price)
+                except Exception:
+                    pass
+
+                if updated:
+                    return trade.trailing_stop_price
 
         return None
 
