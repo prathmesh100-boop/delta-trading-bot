@@ -123,6 +123,10 @@ async def cmd_trade(args):
         daily_loss_limit_pct=0.05,
         leverage=float(args.leverage),
         max_position_size_pct=0.30,      # allow up to 30% of capital per trade with leverage
+        breakeven_trigger_pct=float(args.breakeven_trigger_pct),
+        breakeven_buffer=float(args.breakeven_buffer),
+        profit_lock_threshold_pct=float(args.profit_lock_threshold_pct),
+        profit_lock_pct=float(args.profit_lock_pct),
     )
     risk_mgr = RiskManager(risk_cfg, initial_capital=args.capital)
 
@@ -268,6 +272,14 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Leverage multiplier (default: 5). Must match Delta Exchange setting.")
     p_trade.add_argument("--resolution", type=int, default=15,
                          help="Candle resolution in minutes")
+    p_trade.add_argument("--breakeven-trigger-pct", type=float, default=0.005,
+                         help="Profit %% (decimal) at which to move stop to breakeven (default: 0.005)")
+    p_trade.add_argument("--breakeven-buffer", type=float, default=0.0,
+                         help="Buffer added to breakeven price (decimal price amount, default: 0.0)")
+    p_trade.add_argument("--profit-lock-threshold-pct", type=float, default=0.01,
+                         help="Profit %% (decimal) required to enable profit-lock (default: 0.01)")
+    p_trade.add_argument("--profit-lock-pct", type=float, default=0.005,
+                         help="Profit-lock tightness as decimal percent (default: 0.005)")
 
     # backtest
     p_bt = sub.add_parser("backtest", help="Backtest a strategy")
