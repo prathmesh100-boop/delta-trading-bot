@@ -24,7 +24,7 @@ from api import (
 )
 from risk import RiskConfig, RiskManager, TradeRecord
 from strategy import BaseStrategy, Signal, SignalType
-from notifier import send
+from notifier import send, send_trade_alert
 
 logger = logging.getLogger(__name__)
 
@@ -218,7 +218,33 @@ class ExecutionEngine:
                 return
 
         # ── Generate signal ───────────────────
-        signal = self.strategy.generate_signal(df, self.symbol)
+        # If strategy requests multi-timeframe confirmation, fetch HTF candles
+        htf_df = None
+        try:
+            if getattr(self.strategy, "params", {}).get("mtf_confirm"):
+                htf_res = self.strategy.params.get("htf_resolution", self.resolution * 3)
+                end_htf = end
+                start_htf = end_htf - int(htf_res) * 60 * 200
+                h_candles = await self.rest.get_ohlcv(self.symbol, htf_res, start_htf, end_htf)
+                if h_candles:
+                    rows = [
+                        {
+                            "timestamp": c.timestamp,
+                            "open": c.open,
+                            "high": c.high,
+                            "low": c.low,
+                            "close": c.close,
+                            "volume": c.volume,
+                        }
+                        for c in h_candles
+                    ]
+                    htf_df = pd.DataFrame(rows)
+                    htf_df["timestamp"] = pd.to_datetime(htf_df["timestamp"], unit="ms")
+                    htf_df = htf_df.set_index("timestamp").sort_index()
+        except Exception:
+            htf_df = None
+
+        signal = self.strategy.generate_signal(df, self.symbol, htf_df)
         logger.info("[%s] Signal: %s @ %.4f", self.symbol, signal.type, latest_price)
 
         if signal.type == SignalType.HOLD:
@@ -304,13 +330,17 @@ class ExecutionEngine:
             signal.stop_loss or 0, signal.take_profit or 0,
         )
         try:
-            send(
-                f"🚀 ENTRY {trade.side.upper()} {self.symbol}\n"
-                f"Price: {price:.2f}\n"
-                f"Size: {size_lots} lots"
-            )
+            # Send structured trade alert
+            send_trade_alert(trade)
         except Exception:
-            pass
+            try:
+                send(
+                    f"🚀 ENTRY {trade.side.upper()} {self.symbol}\n"
+                    f"Price: {price:.2f}\n"
+                    f"Size: {size_lots} lots"
+                )
+            except Exception:
+                pass
 
     async def _place_stop_order(self, signal: Signal, size_lots: int, entry_price: float):
         is_long = signal.type == SignalType.LONG

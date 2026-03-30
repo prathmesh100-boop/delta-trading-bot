@@ -261,7 +261,7 @@ def build_parser() -> argparse.ArgumentParser:
     # trade
     p_trade = sub.add_parser("trade", help="Run live trading bot")
     p_trade.add_argument("--strategy", default="ema_crossover",
-                         choices=["ema_crossover", "bollinger_mean_reversion"])
+                         choices=["ema_crossover", "bollinger_mean_reversion", "smart_money"])
     p_trade.add_argument("--symbol", default="ETH_USDT")
     p_trade.add_argument("--capital", type=float, default=20.0)
     p_trade.add_argument("--leverage", type=int, default=5,
@@ -272,7 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
     # backtest
     p_bt = sub.add_parser("backtest", help="Backtest a strategy")
     p_bt.add_argument("--strategy", default="ema_crossover",
-                      choices=["ema_crossover", "bollinger_mean_reversion"])
+                      choices=["ema_crossover", "bollinger_mean_reversion", "smart_money"])
     p_bt.add_argument("--symbol", default="BTCUSD")
     p_bt.add_argument("--capital", type=float, default=10_000.0)
     p_bt.add_argument("--data-file", default=None, help="Path to CSV OHLCV data")
@@ -280,7 +280,7 @@ def build_parser() -> argparse.ArgumentParser:
     # optimize
     p_opt = sub.add_parser("optimize", help="Grid-search parameter optimisation")
     p_opt.add_argument("--strategy", default="ema_crossover",
-                       choices=["ema_crossover", "bollinger_mean_reversion"])
+                       choices=["ema_crossover", "bollinger_mean_reversion", "smart_money"])
     p_opt.add_argument("--symbol", default="BTCUSD")
     p_opt.add_argument("--capital", type=float, default=10_000.0)
 

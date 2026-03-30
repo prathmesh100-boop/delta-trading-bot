@@ -53,7 +53,7 @@ class BaseStrategy(ABC):
         self.params = params or {}
 
     @abstractmethod
-    def generate_signal(self, df: pd.DataFrame, symbol: str) -> Signal:
+    def generate_signal(self, df: pd.DataFrame, symbol: str, htf_df: Optional[pd.DataFrame] = None) -> Signal:
         """
         :param df: OHLCV DataFrame, datetime-indexed, ascending.
         :param symbol: trading symbol string
@@ -122,7 +122,7 @@ class EMACrossoverStrategy(BaseStrategy):
         merged = {**self.DEFAULT_PARAMS, **(params or {})}
         super().__init__(merged)
 
-    def generate_signal(self, df: pd.DataFrame, symbol: str) -> Signal:
+    def generate_signal(self, df: pd.DataFrame, symbol: str, htf_df: Optional[pd.DataFrame] = None) -> Signal:
         if len(df) < self.params["slow_ema"] + 10:
             return Signal(SignalType.HOLD, symbol, df["close"].iloc[-1])
 
@@ -166,6 +166,122 @@ class EMACrossoverStrategy(BaseStrategy):
                 take_profit=price - tp_dist,
                 confidence=min(1.0, (50 - rsi_now) / 20 + 0.5),
                 metadata={"fast_ema": fast_now, "slow_ema": slow_now, "rsi": rsi_now},
+            )
+
+        return Signal(SignalType.HOLD, symbol, price)
+
+
+class SmartMoneyStrategy(BaseStrategy):
+    """
+    SmartMoneyStrategy — faster, higher-frequency entries with trend + scalp modes.
+    - Fast EMA (5) vs Slow EMA (20) for trend entries
+    - RSI-based scalp entries for more trades
+    - ATR-based stops and scaled TP
+    """
+
+    name = "smart_money"
+
+    def __init__(self, params: Dict = None):
+        defaults = {
+            "fast_ema": 5,
+            "slow_ema": 20,
+            "rsi_period": 14,
+            "atr_period": 14,
+            "atr_sl_multiplier": 1.2,
+            "risk_reward_trend": 1.8,
+            "confidence_trend": 0.9,
+            "confidence_scalp": 0.7,
+            # Multi-timeframe confirmation defaults
+            "mtf_confirm": True,
+            "htf_resolution": 15,
+        }
+        merged = {**defaults, **(params or {})}
+        super().__init__(merged)
+
+    def generate_signal(self, df: pd.DataFrame, symbol: str, htf_df: Optional[pd.DataFrame] = None) -> Signal:
+        p = self.params
+        if len(df) < max(p["slow_ema"], p["rsi_period"]) + 5:
+            return Signal(SignalType.HOLD, symbol, df["close"].iloc[-1])
+
+        close = df["close"]
+        ema_fast = self.ema(close, p["fast_ema"])
+        ema_slow = self.ema(close, p["slow_ema"])
+        rsi = self.rsi(close, p["rsi_period"])
+        atr = self.atr(df, p["atr_period"])
+
+        price = close.iloc[-1]
+        f, s = ema_fast.iloc[-1], ema_slow.iloc[-1]
+        f_prev, s_prev = ema_fast.iloc[-2], ema_slow.iloc[-2]
+        r = rsi.iloc[-1]
+        atr_val = atr.iloc[-1]
+
+        sl_dist = atr_val * p["atr_sl_multiplier"]
+        tp_dist = sl_dist * p["risk_reward_trend"]
+
+        # Trend entries (higher confidence)
+        if f_prev < s_prev and f > s and r > 45:
+            # optional higher-timeframe confirmation
+            if p.get("mtf_confirm") and htf_df is not None:
+                try:
+                    h_close = htf_df["close"]
+                    h_fast = self.ema(h_close, p["fast_ema"])
+                    h_slow = self.ema(h_close, p["slow_ema"])
+                    if h_fast.iloc[-1] <= h_slow.iloc[-1]:
+                        return Signal(SignalType.HOLD, symbol, price)
+                except Exception:
+                    pass
+            return Signal(
+                type=SignalType.LONG,
+                symbol=symbol,
+                price=price,
+                stop_loss=price - sl_dist,
+                take_profit=price + tp_dist,
+                confidence=p["confidence_trend"],
+                metadata={"ema_fast": float(f), "ema_slow": float(s), "rsi": float(r)},
+            )
+
+        if f_prev > s_prev and f < s and r < 55:
+            # optional higher-timeframe confirmation
+            if p.get("mtf_confirm") and htf_df is not None:
+                try:
+                    h_close = htf_df["close"]
+                    h_fast = self.ema(h_close, p["fast_ema"])
+                    h_slow = self.ema(h_close, p["slow_ema"])
+                    if h_fast.iloc[-1] >= h_slow.iloc[-1]:
+                        return Signal(SignalType.HOLD, symbol, price)
+                except Exception:
+                    pass
+            return Signal(
+                type=SignalType.SHORT,
+                symbol=symbol,
+                price=price,
+                stop_loss=price + sl_dist,
+                take_profit=price - tp_dist,
+                confidence=p["confidence_trend"],
+                metadata={"ema_fast": float(f), "ema_slow": float(s), "rsi": float(r)},
+            )
+
+        # Scalp entries (more frequent, lower confidence)
+        if r < 30:
+            return Signal(
+                type=SignalType.LONG,
+                symbol=symbol,
+                price=price,
+                stop_loss=price - sl_dist,
+                take_profit=price + sl_dist * 1.5,
+                confidence=p["confidence_scalp"],
+                metadata={"rsi": float(r)},
+            )
+
+        if r > 70:
+            return Signal(
+                type=SignalType.SHORT,
+                symbol=symbol,
+                price=price,
+                stop_loss=price + sl_dist,
+                take_profit=price - sl_dist * 1.5,
+                confidence=p["confidence_scalp"],
+                metadata={"rsi": float(r)},
             )
 
         return Signal(SignalType.HOLD, symbol, price)
@@ -220,7 +336,7 @@ class BollingerMeanReversionStrategy(BaseStrategy):
         dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
         return dx.ewm(alpha=1 / period, adjust=False).mean()
 
-    def generate_signal(self, df: pd.DataFrame, symbol: str) -> Signal:
+    def generate_signal(self, df: pd.DataFrame, symbol: str, htf_df: Optional[pd.DataFrame] = None) -> Signal:
         p = self.params
         if len(df) < p["bb_period"] + p["adx_period"] + 5:
             return Signal(SignalType.HOLD, symbol, df["close"].iloc[-1])
@@ -278,6 +394,7 @@ class BollingerMeanReversionStrategy(BaseStrategy):
 STRATEGY_REGISTRY: Dict[str, type] = {
     "ema_crossover": EMACrossoverStrategy,
     "bollinger_mean_reversion": BollingerMeanReversionStrategy,
+    "smart_money": SmartMoneyStrategy,
 }
 
 
