@@ -31,10 +31,10 @@ class SignalType(str, Enum):
 class Signal:
     type: SignalType
     symbol: str
-    price: float                           # entry / reference price
+    price: float
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
-    confidence: float = 1.0               # 0–1, used for position sizing
+    confidence: float = 1.0
     metadata: Dict = None
 
     def __post_init__(self):
@@ -47,11 +47,6 @@ class Signal:
 # ─────────────────────────────────────────────
 
 class BaseStrategy(ABC):
-    """
-    All strategies inherit from here.
-    Implement generate_signal() to return a Signal given a DataFrame of OHLCV.
-    """
-
     name: str = "base"
 
     def __init__(self, params: Dict = None):
@@ -60,13 +55,10 @@ class BaseStrategy(ABC):
     @abstractmethod
     def generate_signal(self, df: pd.DataFrame, symbol: str) -> Signal:
         """
-        :param df: OHLCV DataFrame with columns [open, high, low, close, volume].
-                   Indexed by datetime, sorted ascending. At least 200 rows recommended.
+        :param df: OHLCV DataFrame, datetime-indexed, ascending.
         :param symbol: trading symbol string
         :return: Signal
         """
-
-    # ── Common indicator helpers ──────────────
 
     @staticmethod
     def ema(series: pd.Series, period: int) -> pd.Series:
@@ -86,7 +78,6 @@ class BaseStrategy(ABC):
     def bollinger_bands(
         series: pd.Series, period: int = 20, std_dev: float = 2.0
     ) -> Tuple[pd.Series, pd.Series, pd.Series]:
-        """Returns (upper, middle, lower)."""
         middle = series.rolling(period).mean()
         std = series.rolling(period).std()
         return middle + std_dev * std, middle, middle - std_dev * std
@@ -101,23 +92,15 @@ class BaseStrategy(ABC):
 
 
 # ─────────────────────────────────────────────
-# Strategy 1 — Trend Following
-# EMA Crossover (fast/slow) filtered by RSI + multi-timeframe confirmation
+# Strategy 1 — EMA Crossover (Trend Following)
 # ─────────────────────────────────────────────
 
 class EMACrossoverStrategy(BaseStrategy):
     """
-    Entry rules
-    -----------
-    LONG  : fast EMA crosses above slow EMA AND RSI is between 50–70 (bullish, not overbought)
-    SHORT : fast EMA crosses below slow EMA AND RSI is between 30–50 (bearish, not oversold)
-
-    Exit rules
-    ----------
-    Stop-loss  : ATR-based (atr_multiplier × ATR below/above entry)
-    Take-profit: risk_reward × risk distance
-
-    Optional multi-timeframe filter: higher-TF trend must agree with signal.
+    LONG  : fast EMA crosses above slow EMA AND RSI 50–70
+    SHORT : fast EMA crosses below slow EMA AND RSI 30–50
+    Stop  : ATR-based
+    TP    : risk_reward × risk distance
     """
 
     name = "ema_crossover"
@@ -149,14 +132,12 @@ class EMACrossoverStrategy(BaseStrategy):
         rsi = self.rsi(close, self.params["rsi_period"])
         atr = self.atr(df, self.params["atr_period"])
 
-        # Current and previous bar values
         fast_now, fast_prev = fast.iloc[-1], fast.iloc[-2]
         slow_now, slow_prev = slow.iloc[-1], slow.iloc[-2]
         rsi_now = rsi.iloc[-1]
         atr_now = atr.iloc[-1]
         price = close.iloc[-1]
 
-        # Detect crossover (previous bar was opposite side)
         bullish_cross = fast_prev <= slow_prev and fast_now > slow_now
         bearish_cross = fast_prev >= slow_prev and fast_now < slow_now
 
@@ -191,23 +172,16 @@ class EMACrossoverStrategy(BaseStrategy):
 
 
 # ─────────────────────────────────────────────
-# Strategy 2 — Mean Reversion
-# Bollinger Bands + Volume confirmation + RSI extreme filter
+# Strategy 2 — Bollinger Mean Reversion
 # ─────────────────────────────────────────────
 
 class BollingerMeanReversionStrategy(BaseStrategy):
     """
-    Entry rules
-    -----------
-    LONG  : close < lower band AND volume spike AND RSI < oversold threshold
-    SHORT : close > upper band AND volume spike AND RSI > overbought threshold
-
-    Exits at middle band (mean reversion target) with ATR-based stop.
-
-    Notes
-    -----
-    Mean reversion works best in ranging/consolidating markets.
-    Always combine with a market-regime filter (ADX < 25 = ranging).
+    LONG  : close < lower band AND volume spike AND RSI < oversold
+    SHORT : close > upper band AND volume spike AND RSI > overbought
+    TP    : reversion to middle band
+    Stop  : ATR-based
+    Filter: ADX < adx_max (skip in strong trends)
     """
 
     name = "bollinger_mean_reversion"
@@ -219,11 +193,11 @@ class BollingerMeanReversionStrategy(BaseStrategy):
         "rsi_oversold": 35,
         "rsi_overbought": 65,
         "volume_lookback": 20,
-        "volume_spike_factor": 1.5,       # current volume > 1.5× 20-bar avg
+        "volume_spike_factor": 1.5,
         "atr_period": 14,
         "atr_sl_multiplier": 1.5,
         "adx_period": 14,
-        "adx_max": 30,                    # skip signal in strong trends
+        "adx_max": 30,
     }
 
     def __init__(self, params: Dict = None):
@@ -235,17 +209,15 @@ class BollingerMeanReversionStrategy(BaseStrategy):
         high, low, close = df["high"], df["low"], df["close"]
         plus_dm = high.diff().clip(lower=0)
         minus_dm = (-low.diff()).clip(lower=0)
-        # If plus_dm > minus_dm: keep plus_dm, else 0
         plus_dm = plus_dm.where(plus_dm > minus_dm, 0)
         minus_dm = minus_dm.where(minus_dm > plus_dm, 0)
-
         tr = pd.concat(
             [high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1
         ).max(axis=1)
         atr = tr.ewm(alpha=1 / period, adjust=False).mean()
         plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
         minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
-        dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan))
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
         return dx.ewm(alpha=1 / period, adjust=False).mean()
 
     def generate_signal(self, df: pd.DataFrame, symbol: str) -> Signal:
@@ -268,15 +240,13 @@ class BollingerMeanReversionStrategy(BaseStrategy):
         adx_now = adx_vals.iloc[-1]
         atr_now = atr_vals.iloc[-1]
         sl_dist = p["atr_sl_multiplier"] * atr_now
-        tp = middle.iloc[-1]         # target = reversion to mean
+        tp = middle.iloc[-1]
 
-        # Skip if market is strongly trending
         if adx_now > p["adx_max"]:
-            logger.debug("%s: ADX=%.1f > %.1f, skipping mean-reversion signal", symbol, adx_now, p["adx_max"])
+            logger.debug("%s: ADX=%.1f > %.1f, skipping mean-reversion", symbol, adx_now, p["adx_max"])
             return Signal(SignalType.HOLD, symbol, price)
 
         if price < lower.iloc[-1] and rsi_now < p["rsi_oversold"] and vol_spike:
-            logger.debug("%s: Below lower BB, RSI=%.1f, vol spike → LONG", symbol, rsi_now)
             return Signal(
                 type=SignalType.LONG,
                 symbol=symbol,
@@ -288,7 +258,6 @@ class BollingerMeanReversionStrategy(BaseStrategy):
             )
 
         if price > upper.iloc[-1] and rsi_now > p["rsi_overbought"] and vol_spike:
-            logger.debug("%s: Above upper BB, RSI=%.1f, vol spike → SHORT", symbol, rsi_now)
             return Signal(
                 type=SignalType.SHORT,
                 symbol=symbol,
@@ -313,7 +282,6 @@ STRATEGY_REGISTRY: Dict[str, type] = {
 
 
 def load_strategy(name: str, params: Dict = None) -> BaseStrategy:
-    """Factory: instantiate a strategy by name."""
     if name not in STRATEGY_REGISTRY:
         raise ValueError(f"Unknown strategy '{name}'. Available: {list(STRATEGY_REGISTRY)}")
     return STRATEGY_REGISTRY[name](params)

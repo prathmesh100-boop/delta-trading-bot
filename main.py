@@ -3,13 +3,25 @@ main.py — Entry point for the Delta Exchange algorithmic trading system.
 
 Usage:
     # Live trading
-    python main.py trade --strategy ema_crossover --symbol BTCUSD --capital 10000
+    python main.py trade --strategy ema_crossover --symbol ETH_USDT --capital 20
 
     # Backtest with sample data
     python main.py backtest --strategy bollinger_mean_reversion --symbol BTCUSD
 
     # Parameter optimisation
     python main.py optimize --strategy ema_crossover --symbol BTCUSD
+
+IMPORTANT — .env file must contain:
+    DELTA_API_KEY=your_key_here
+    DELTA_API_SECRET=your_secret_here
+
+NOTES on lot sizes (Delta Exchange):
+    - All orders are placed in integer lots, NOT fractional amounts.
+    - For ETH_USDT perpetuals, 1 lot = 0.001 ETH typically.
+    - The engine fetches product info on startup and converts USD → lots automatically.
+    - With $20 capital and 1x leverage the position size will be very small (1-2 lots).
+    - Increase --leverage to 5 or 10 to trade with more notional on small capital
+      (but only if you understand the risk).
 """
 
 import argparse
@@ -22,7 +34,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-# ── Logging setup ─────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,8 +46,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
-
 # ── Local imports ─────────────────────────────────────────────────────────────
+
 from api import DeltaRESTClient
 from backtest import Backtester, BacktestConfig
 from execution import ExecutionEngine
@@ -48,9 +60,8 @@ from strategy import EMACrossoverStrategy, BollingerMeanReversionStrategy, load_
 # ─────────────────────────────────────────────
 
 def load_env_keys() -> tuple:
-    """Load API credentials from environment variables."""
-    api_key = os.getenv("DELTA_API_KEY", "")
-    api_secret = os.getenv("DELTA_API_SECRET", "")
+    api_key = os.getenv("DELTA_API_KEY", "").strip()
+    api_secret = os.getenv("DELTA_API_SECRET", "").strip()
     if not api_key or not api_secret:
         logger.warning(
             "DELTA_API_KEY / DELTA_API_SECRET not set. "
@@ -61,25 +72,23 @@ def load_env_keys() -> tuple:
 
 def generate_synthetic_ohlcv(n: int = 2000, seed: int = 42) -> pd.DataFrame:
     """
-    Generate realistic-looking synthetic BTC/USD price data for demo purposes.
-    Uses geometric Brownian motion + volatility clustering.
+    Synthetic BTC/USD price data for backtesting — geometric Brownian motion
+    with GARCH-lite volatility clustering.
     """
     rng = np.random.default_rng(seed)
-    dt = 1 / (24 * 365)                  # 1 hour expressed as fraction of year
-    mu = 0.15                            # 15% annualised drift
-    sigma_base = 0.80                    # 80% annualised volatility (crypto)
+    dt = 1 / (24 * 365)
+    mu = 0.15
+    sigma_base = 0.80
 
     prices = [30_000.0]
     vols = [sigma_base]
     for _ in range(n - 1):
-        # GARCH-lite: vol reverts to mean with some randomness
         v = 0.9 * vols[-1] + 0.1 * sigma_base + 0.05 * abs(rng.standard_normal())
         vols.append(v)
         ret = (mu - 0.5 * v ** 2) * dt + v * np.sqrt(dt) * rng.standard_normal()
         prices.append(prices[-1] * np.exp(ret))
 
     prices = np.array(prices)
-    # Build OHLCV from close prices
     hi = prices * (1 + rng.uniform(0.001, 0.015, n))
     lo = prices * (1 - rng.uniform(0.001, 0.015, n))
     op = np.roll(prices, 1)
@@ -101,27 +110,45 @@ async def cmd_trade(args):
     """Start live trading."""
     api_key, api_secret = load_env_keys()
     if not api_key:
-        print("ERROR: Set DELTA_API_KEY and DELTA_API_SECRET environment variables.")
+        print("ERROR: Set DELTA_API_KEY and DELTA_API_SECRET in your .env file.")
         return
 
     strategy = load_strategy(args.strategy)
     risk_cfg = RiskConfig(
         risk_per_trade=0.01,
         max_drawdown_pct=0.10,
-        daily_loss_limit_pct=0.03,
+        daily_loss_limit_pct=0.05,
+        leverage=float(args.leverage),
+        max_position_size_pct=0.30,      # allow up to 30% of capital per trade with leverage
     )
     risk_mgr = RiskManager(risk_cfg, initial_capital=args.capital)
 
     async with DeltaRESTClient(api_key, api_secret) as rest:
-        # Resolve product_id from symbol
+        # ── Fetch and cache all products ──────
         products = await rest.get_products()
         product = next((p for p in products if p.get("symbol") == args.symbol), None)
         if not product:
-            print(f"Symbol {args.symbol} not found. Available:")
-            for p in products[:10]:
-                print(f"  {p['symbol']} (id={p['id']})")
+            print(f"\nSymbol '{args.symbol}' not found.")
+            print("Available USDT perpetuals (first 20):")
+            usdt = [p for p in products if "USDT" in p.get("symbol", "")][:20]
+            for p in usdt:
+                print(f"  {p['symbol']:20s}  contract_value={p.get('contract_value')}  min_size={p.get('min_size')}")
             return
+
         product_id = product["id"]
+        contract_value = product.get("contract_value", "?")
+        min_size = product.get("min_size", 1)
+
+        print(f"\n{'═'*60}")
+        print(f"  Symbol        : {args.symbol}")
+        print(f"  Product ID    : {product_id}")
+        print(f"  Contract value: {contract_value}")
+        print(f"  Min size      : {min_size} lot(s)")
+        print(f"  Capital       : ${args.capital:.2f}")
+        print(f"  Leverage      : {args.leverage}x")
+        print(f"  Strategy      : {args.strategy}")
+        print(f"  Resolution    : {args.resolution}m candles")
+        print(f"{'═'*60}\n")
 
         engine = ExecutionEngine(
             rest_client=rest,
@@ -133,15 +160,15 @@ async def cmd_trade(args):
             api_key=api_key,
             api_secret=api_secret,
         )
+
         logger.info(
-            "🚀 Starting live trading: %s | strategy=%s | capital=%.2f",
-            args.symbol, args.strategy, args.capital,
+            "🚀 Starting live trading: %s | strategy=%s | capital=%.2f | leverage=%dx",
+            args.symbol, args.strategy, args.capital, args.leverage,
         )
         await engine.run_polling(interval_seconds=args.resolution * 60)
 
 
 def cmd_backtest(args):
-    """Run backtest on synthetic or loaded data."""
     print(f"\n{'═'*55}")
     print(f"  Backtest: {args.strategy} on {args.symbol}")
     print(f"{'═'*55}")
@@ -170,20 +197,17 @@ def cmd_backtest(args):
         pnl_str = f"+${t.net_pnl:.2f}" if t.net_pnl >= 0 else f"-${abs(t.net_pnl):.2f}"
         print(f"  {t.entry_time.date()} {t.side:5s} → {t.exit_reason:6s}  {pnl_str:>10}")
 
-    # Save equity curve
     result.equity_curve.to_csv("equity_curve.csv")
     print(f"\n  Equity curve saved to equity_curve.csv")
 
 
 def cmd_optimize(args):
-    """Grid-search parameter optimisation."""
     print(f"\n{'═'*55}")
     print(f"  Optimising {args.strategy} on {args.symbol}")
     print(f"  WARNING: Validate results on out-of-sample data!")
     print(f"{'═'*55}\n")
 
     df = generate_synthetic_ohlcv(n=3000)
-    # 70/30 split: train on first 70%
     split = int(len(df) * 0.7)
     train_df = df.iloc[:split]
     test_df = df.iloc[split:]
@@ -207,13 +231,13 @@ def cmd_optimize(args):
 
     backtester = Backtester(BacktestConfig(initial_capital=args.capital))
     best_params, train_result = backtester.optimize(
-        train_df, strategy_class, param_grid, symbol=args.symbol, metric="sharpe_ratio"
+        train_df, strategy_class, param_grid,
+        symbol=args.symbol, metric="sharpe_ratio",
     )
 
     print("  TRAIN SET results:")
     print(train_result.summary())
 
-    # Validate on held-out data
     best_strat = strategy_class(best_params)
     test_result = backtester.run(test_df, best_strat, symbol=args.symbol)
     print("\n  TEST SET (out-of-sample) results:")
@@ -235,8 +259,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_trade = sub.add_parser("trade", help="Run live trading bot")
     p_trade.add_argument("--strategy", default="ema_crossover",
                          choices=["ema_crossover", "bollinger_mean_reversion"])
-    p_trade.add_argument("--symbol", default="BTCUSD")
-    p_trade.add_argument("--capital", type=float, default=1000.0)
+    p_trade.add_argument("--symbol", default="ETH_USDT")
+    p_trade.add_argument("--capital", type=float, default=20.0)
+    p_trade.add_argument("--leverage", type=int, default=5,
+                         help="Leverage multiplier (default: 5). Must match Delta Exchange setting.")
     p_trade.add_argument("--resolution", type=int, default=15,
                          help="Candle resolution in minutes")
 

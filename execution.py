@@ -2,6 +2,12 @@
 execution.py — Real-time execution engine.
 Wires together API client, strategy, and risk manager.
 Handles signal → order placement → position tracking loop.
+
+FIXES:
+  - Calls rest.usd_to_lots() to convert USD notional → integer lot count
+  - Bootstraps product info before trading so lot conversion works
+  - Guards against 0-lot orders (skips gracefully with a warning)
+  - Passes symbol to usd_to_lots so contract_value is looked up correctly
 """
 
 import asyncio
@@ -14,7 +20,7 @@ import pandas as pd
 
 from api import (
     DeltaRESTClient, DeltaWSClient,
-    Order, OrderSide, OrderStatus, OrderType, OHLCV
+    Order, OrderSide, OrderStatus, OrderType, OHLCV,
 )
 from risk import RiskConfig, RiskManager, TradeRecord
 from strategy import BaseStrategy, Signal, SignalType
@@ -23,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
-# Candle buffer — maintains a rolling OHLCV window
+# Candle buffer
 # ─────────────────────────────────────────────
 
 class CandleBuffer:
@@ -40,8 +46,14 @@ class CandleBuffer:
         if not self._data:
             return None
         rows = [
-            {"timestamp": c.timestamp, "open": c.open, "high": c.high,
-             "low": c.low, "close": c.close, "volume": c.volume}
+            {
+                "timestamp": c.timestamp,
+                "open": c.open,
+                "high": c.high,
+                "low": c.low,
+                "close": c.close,
+                "volume": c.volume,
+            }
             for c in self._data
         ]
         df = pd.DataFrame(rows)
@@ -54,7 +66,7 @@ class CandleBuffer:
 
 
 # ─────────────────────────────────────────────
-# Trade logger (CSV-based audit trail)
+# Trade logger
 # ─────────────────────────────────────────────
 
 class TradeLogger:
@@ -70,7 +82,7 @@ class TradeLogger:
             "exit_time": trade.exit_time,
             "entry_price": trade.entry_price,
             "exit_price": trade.exit_price,
-            "size": trade.size,
+            "size_lots": trade.size,
             "pnl": trade.realised_pnl,
             "order_id": trade.order_id,
         })
@@ -88,11 +100,13 @@ class TradeLogger:
 class ExecutionEngine:
     """
     Async execution loop:
-      1. Fetch / receive OHLCV candles
-      2. Run strategy → Signal
-      3. Risk check
-      4. Place order via REST
-      5. Track position and manage exits
+      1. Bootstrap product info + historical candles
+      2. Poll for new candles every `interval_seconds`
+      3. Run strategy → Signal
+      4. Risk check
+      5. Convert USD notional → integer lots
+      6. Place order via REST
+      7. Track position and manage exits
     """
 
     def __init__(
@@ -120,9 +134,7 @@ class ExecutionEngine:
         self._current_trade: Optional[TradeRecord] = None
         self._running = False
 
-    # ─────────────────────────────────────────
-    # Bootstrap
-    # ─────────────────────────────────────────
+    # ── Bootstrap ─────────────────────────────
 
     async def bootstrap_history(self):
         """Pre-fill candle buffer with recent historical data."""
@@ -135,16 +147,34 @@ class ExecutionEngine:
             self.buffer.push(c)
         logger.info("Buffer primed with %d candles", len(self.buffer))
 
-    # ─────────────────────────────────────────
-    # Main loop (polling mode)
-    # ─────────────────────────────────────────
+    async def bootstrap_product(self):
+        """
+        Fetch and cache product info so usd_to_lots() works correctly.
+        Also logs contract_value and lot sizing for transparency.
+        """
+        logger.info("Fetching product info for %s…", self.symbol)
+        product = await self.rest.get_product(self.symbol)
+        if product:
+            cv = product.get("contract_value", "?")
+            min_size = product.get("min_size", "?")
+            logger.info(
+                "Product: %s | id=%s | contract_value=%s | min_size=%s",
+                self.symbol,
+                product.get("id"),
+                cv,
+                min_size,
+            )
+        else:
+            logger.warning(
+                "Product info not found for %s — lot calculation may be inaccurate",
+                self.symbol,
+            )
+
+    # ── Main loop ─────────────────────────────
 
     async def run_polling(self, interval_seconds: int = 60):
-        """
-        Polling execution loop — fetches latest candle every `interval_seconds`.
-        Use run_websocket() for lower latency.
-        """
         self._running = True
+        await self.bootstrap_product()      # ← must come before bootstrap_history
         await self.bootstrap_history()
 
         while self._running:
@@ -165,18 +195,19 @@ class ExecutionEngine:
 
         df = self.buffer.to_dataframe()
         if df is None or len(df) < 60:
-            logger.warning("Insufficient data in buffer (%d bars)", len(df or []))
+            logger.warning("Insufficient data in buffer (%d bars)", len(df) if df is not None else 0)
             return
 
-        latest_price = df["close"].iloc[-1]
+        latest_price = float(df["close"].iloc[-1])
 
         # ── Check trailing stop / TP / SL ────
         if self._current_trade:
             self.risk.update_trailing_stops(self.symbol, latest_price)
 
-            exit_trade = self.risk.should_exit_by_stop(self.symbol, latest_price) or \
-                         self.risk.should_exit_by_tp(self.symbol, latest_price)
-
+            exit_trade = (
+                self.risk.should_exit_by_stop(self.symbol, latest_price) or
+                self.risk.should_exit_by_tp(self.symbol, latest_price)
+            )
             if exit_trade:
                 await self._execute_close(exit_trade, latest_price, reason="risk_mgr")
                 return
@@ -195,22 +226,39 @@ class ExecutionEngine:
                 (self._current_trade.side == "short" and signal.type == SignalType.LONG)
             )
             if opposite:
-                await self._execute_close(self._current_trade, latest_price, reason="signal_flip")
+                await self._execute_close(
+                    self._current_trade, latest_price, reason="signal_flip"
+                )
 
         # ── Open new position ─────────────────
         if signal.type in (SignalType.LONG, SignalType.SHORT):
             if not self.risk.check_signal(signal):
                 logger.info("Signal blocked by risk manager")
                 return
+
             size_usd = self.risk.calculate_position_size(signal, latest_price)
-            size_contracts = size_usd / latest_price
-            await self._execute_entry(signal, size_contracts, latest_price)
 
-    # ─────────────────────────────────────────
-    # Order placement helpers
-    # ─────────────────────────────────────────
+            # Convert USD notional → integer lots
+            size_lots = self.rest.usd_to_lots(self.symbol, size_usd, latest_price)
 
-    async def _execute_entry(self, signal: Signal, size: float, price: float):
+            if size_lots < 1:
+                logger.warning(
+                    "Position size too small to place (%.2f USD → %d lots). "
+                    "Increase capital or reduce risk_per_trade.",
+                    size_usd,
+                    size_lots,
+                )
+                return
+
+            logger.info(
+                "Sizing: %.2f USD → %d lots (price=%.4f)",
+                size_usd, size_lots, latest_price,
+            )
+            await self._execute_entry(signal, size_lots, latest_price)
+
+    # ── Order helpers ─────────────────────────
+
+    async def _execute_entry(self, signal: Signal, size_lots: int, price: float):
         side = OrderSide.BUY if signal.type == SignalType.LONG else OrderSide.SELL
         client_id = str(uuid.uuid4())[:8]
 
@@ -218,7 +266,7 @@ class ExecutionEngine:
             product_id=self.product_id,
             side=side,
             order_type=OrderType.MARKET,
-            size=round(size, 4),
+            size=size_lots,              # ← integer lots
             client_order_id=client_id,
         )
 
@@ -232,9 +280,9 @@ class ExecutionEngine:
             symbol=self.symbol,
             side="long" if side == OrderSide.BUY else "short",
             entry_price=price,
-            size=size,
-            stop_loss=signal.stop_loss,
-            take_profit=signal.take_profit,
+            size=size_lots,
+            stop_loss=signal.stop_loss or 0.0,
+            take_profit=signal.take_profit or 0.0,
             entry_time=datetime.utcnow(),
             order_id=order.order_id,
             peak_price=price,
@@ -242,24 +290,23 @@ class ExecutionEngine:
         self._current_trade = trade
         self.risk.register_trade(trade)
 
-        # Place stop-loss order on exchange
         if signal.stop_loss:
-            await self._place_stop_order(signal, size, price)
+            await self._place_stop_order(signal, size_lots, price)
 
         logger.info(
-            "ENTRY: %s %s size=%.4f entry=%.4f sl=%.4f tp=%.4f",
-            trade.side, self.symbol, size, price, signal.stop_loss, signal.take_profit,
+            "ENTRY: %s %s lots=%d entry=%.4f sl=%.4f tp=%.4f",
+            trade.side, self.symbol, size_lots, price,
+            signal.stop_loss or 0, signal.take_profit or 0,
         )
 
-    async def _place_stop_order(self, signal: Signal, size: float, entry_price: float):
-        """Place a stop-market on the exchange as backup SL."""
+    async def _place_stop_order(self, signal: Signal, size_lots: int, entry_price: float):
         is_long = signal.type == SignalType.LONG
         sl_side = OrderSide.SELL if is_long else OrderSide.BUY
         sl_order = Order(
             product_id=self.product_id,
             side=sl_side,
             order_type=OrderType.STOP_MARKET,
-            size=round(size, 4),
+            size=size_lots,              # ← integer lots
             stop_price=round(signal.stop_loss, 2),
             reduce_only=True,
         )
@@ -275,7 +322,7 @@ class ExecutionEngine:
             product_id=self.product_id,
             side=close_side,
             order_type=OrderType.MARKET,
-            size=round(trade.size, 4),
+            size=int(trade.size),        # ← ensure integer
             reduce_only=True,
         )
         try:
@@ -284,7 +331,6 @@ class ExecutionEngine:
             logger.error("Close order failed: %s", exc)
             return
 
-        # Cancel any resting SL orders
         await self.rest.cancel_all_orders(self.product_id)
 
         now = datetime.utcnow()
