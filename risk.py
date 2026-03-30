@@ -30,6 +30,11 @@ class RiskConfig:
     risk_per_trade: float = 0.01          # 1% of capital per trade
     max_position_size_pct: float = 0.20   # never use more than 20% of capital (with leverage)
     leverage: float = 1.0                 # match the leverage set on Delta Exchange
+    leverage_by_symbol: Dict[str, float] = field(default_factory=lambda: {
+        "BTC_USDT": 10.0,
+        "ETH_USDT": 20.0,
+        "SOL_USDT": 15.0,
+    })
 
     # Portfolio limits
     max_open_trades: int = 1              # conservative: 1 at a time for small accounts
@@ -158,6 +163,7 @@ class RiskManager:
         self,
         signal: Signal,
         current_price: float,
+        symbol: str,
     ) -> float:
         """
         Returns USD notional to trade.
@@ -177,9 +183,10 @@ class RiskManager:
             stop_distance_pct = max(stop_distance_pct, 1e-6)  # avoid division by zero
 
         risk_usd = self.current_capital * self.cfg.risk_per_trade * signal.confidence
-        position_usd = (risk_usd / stop_distance_pct) * self.cfg.leverage
+        symbol_leverage = self.cfg.leverage_by_symbol.get(symbol, self.cfg.leverage)
+        position_usd = (risk_usd / stop_distance_pct) * symbol_leverage
 
-        max_usd = self.current_capital * self.cfg.max_position_size_pct * self.cfg.leverage
+        max_usd = self.current_capital * self.cfg.max_position_size_pct * symbol_leverage
         position_usd = min(position_usd, max_usd)
 
         logger.info(

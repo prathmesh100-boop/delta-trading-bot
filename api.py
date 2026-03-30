@@ -117,6 +117,13 @@ class DeltaRESTClient:
     BASE_URL = "https://api.delta.exchange"
     # BASE_URL = "https://testnet-api.delta.exchange"   # uncomment for testnet
 
+    # Hardcoded fallback lot sizes for common symbols (in base asset per lot)
+    FALLBACK_LOT_SIZES = {
+        "BTC_USDT": 0.001,
+        "ETH_USDT": 0.01,
+        "SOL_USDT": 1,
+    }
+
     def __init__(self, api_key: str, api_secret: str):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -275,7 +282,11 @@ class DeltaRESTClient:
         # contract_type: "perpetual_futures", "call_options", etc.
         # For USDT-margined linear: contract_value = base asset per lot (e.g. 0.001 BTC)
         # For USD-margined inverse: contract_value = USD per lot (e.g. 1 USD)
-        contract_value = float(product.get("contract_value", 1) or 1)
+        contract_value_raw = product.get("contract_value")
+        if contract_value_raw is None or float(contract_value_raw) <= 0:
+            contract_value = float(self.FALLBACK_LOT_SIZES.get(symbol, 1))
+        else:
+            contract_value = float(contract_value_raw)
         contract_type = product.get("contract_type", "")
 
         if "inverse" in contract_type.lower() or product.get("quoting_asset", {}).get("symbol", "") in ("BTC", "ETH"):

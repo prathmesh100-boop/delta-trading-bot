@@ -267,7 +267,7 @@ class ExecutionEngine:
                 logger.info("Signal blocked by risk manager")
                 return
 
-            size_usd = self.risk.calculate_position_size(signal, latest_price)
+            size_usd = self.risk.calculate_position_size(signal, latest_price, self.symbol)
 
             # Convert USD notional → integer lots
             size_lots = self.rest.usd_to_lots(self.symbol, size_usd, latest_price)
