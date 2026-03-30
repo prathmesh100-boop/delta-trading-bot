@@ -114,7 +114,7 @@ class DeltaRESTClient:
         - body         : raw JSON string, or "" for GET/DELETE with no body
     """
 
-    BASE_URL = "https://api.delta.exchange"
+    BASE_URL ="https://api.india.delta.exchange"
     # BASE_URL = "https://testnet-api.delta.exchange"   # uncomment for testnet
 
     # Hardcoded fallback lot sizes for common symbols (in base asset per lot)
