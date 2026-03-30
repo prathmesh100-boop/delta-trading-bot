@@ -24,6 +24,9 @@ NOTES on lot sizes (Delta Exchange):
       (but only if you understand the risk).
 """
 
+
+from dotenv import load_dotenv
+load_dotenv()
 import argparse
 import asyncio
 import logging
