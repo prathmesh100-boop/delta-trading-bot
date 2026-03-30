@@ -9,7 +9,7 @@ Production-minded features:
 - Uvicorn run block for straightforward deployment
 """
 from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 from typing import Optional
@@ -80,6 +80,37 @@ def _compute_stats(df: pd.DataFrame) -> dict:
     }
 
 
+def _tail_lines(path: Path, n: int = 200):
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as fh:
+            from collections import deque
+            return list(deque(fh, maxlen=n))
+    except Exception:
+        return []
+
+
+async def _stream_trades(poll_interval: float = 2.0):
+    """SSE-style generator that yields JSON payload when trades file changes."""
+    import json
+    last_mtime = 0
+    while True:
+        try:
+            if TRADE_FILE.exists():
+                mtime = TRADE_FILE.stat().st_mtime
+                if mtime != last_mtime:
+                    last_mtime = mtime
+                    df = _load_trades()
+                    payload = {"stats": _compute_stats(df), "recent": df.tail(20).to_dict(orient="records")}
+                    yield f"data: {json.dumps(payload)}\n\n"
+        except Exception:
+            pass
+        import asyncio
+        await asyncio.sleep(poll_interval)
+
+
+
 def _require_token(request: Request):
     token = os.getenv("DASHBOARD_TOKEN")
     if not token:
@@ -105,6 +136,63 @@ def api_trades(limit: Optional[int] = 100, _ok: bool = Depends(_require_token)):
     df = df.tail(limit)
     payload = df.fillna("").to_dict(orient="records")
     return JSONResponse(content={"trades": payload, "count": len(payload)})
+
+
+@app.get("/api/logs")
+def api_logs(lines: int = 200, _ok: bool = Depends(_require_token)):
+    logs = _tail_lines(ROOT / "trade_history.csv", n=lines)
+    return JSONResponse(content={"lines": logs, "count": len(logs)})
+
+
+@app.get("/stream")
+def stream(request: Request, _ok: bool = Depends(_require_token)):
+    return StreamingResponse(_stream_trades(), media_type="text/event-stream")
+
+
+@app.post("/api/order")
+async def api_order(payload: dict, _ok: bool = Depends(_require_token)):
+    """Place a simple market order via Delta REST. Payload: {symbol, side: 'buy'|'sell', size_lots:int}
+    Requires DELTA_API_KEY and DELTA_API_SECRET in env."""
+    key = os.getenv("DELTA_API_KEY")
+    secret = os.getenv("DELTA_API_SECRET")
+    if not key or not secret:
+        raise HTTPException(status_code=403, detail="API keys not configured")
+
+    symbol = payload.get("symbol")
+    side = payload.get("side")
+    size = int(payload.get("size_lots", 0))
+    if not symbol or side not in ("buy", "sell") or size < 1:
+        raise HTTPException(status_code=400, detail="Invalid order payload")
+
+    from api import DeltaRESTClient, Order, OrderSide, OrderType
+
+    async with DeltaRESTClient(key, secret) as client:
+        # fetch product id
+        prod = await client.get_product(symbol)
+        if not prod:
+            raise HTTPException(status_code=404, detail="Product not found")
+        product_id = int(prod.get("id"))
+
+        order = Order(
+            product_id=product_id,
+            side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
+            order_type=OrderType.MARKET,
+            size=size,
+        )
+        resp = await client.place_order(order)
+        return JSONResponse(content={"order_id": resp.order_id, "status": str(resp.status)})
+
+
+@app.get("/api/positions")
+async def api_positions(_ok: bool = Depends(_require_token)):
+    key = os.getenv("DELTA_API_KEY")
+    secret = os.getenv("DELTA_API_SECRET")
+    if not key or not secret:
+        raise HTTPException(status_code=403, detail="API keys not configured")
+    from api import DeltaRESTClient
+    async with DeltaRESTClient(key, secret) as client:
+        pos = await client.get_positions()
+        return JSONResponse(content={"positions": [p.__dict__ for p in pos]})
 
 
 @app.get("/", response_class=HTMLResponse)
