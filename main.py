@@ -120,6 +120,7 @@ async def cmd_trade(args):
     risk_cfg = RiskConfig(
         risk_per_trade=0.01,
         max_drawdown_pct=0.10,
+        max_open_trades=2, 
         daily_loss_limit_pct=0.05,
         leverage=float(args.leverage),
         max_position_size_pct=0.30,      # allow up to 30% of capital per trade with leverage
