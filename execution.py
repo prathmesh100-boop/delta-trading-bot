@@ -24,6 +24,7 @@ from api import (
 )
 from risk import RiskConfig, RiskManager, TradeRecord
 from strategy import BaseStrategy, Signal, SignalType
+from notifier import send
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +183,10 @@ class ExecutionEngine:
                 await self._tick()
             except Exception as exc:
                 logger.error("Tick error: %s", exc, exc_info=True)
+                try:
+                    send(f"⚠️ ERROR: {str(exc)}")
+                except Exception:
+                    pass
             await asyncio.sleep(interval_seconds)
 
     async def _tick(self):
@@ -298,6 +303,14 @@ class ExecutionEngine:
             trade.side, self.symbol, size_lots, price,
             signal.stop_loss or 0, signal.take_profit or 0,
         )
+        try:
+            send(
+                f"🚀 ENTRY {trade.side.upper()} {self.symbol}\n"
+                f"Price: {price:.2f}\n"
+                f"Size: {size_lots} lots"
+            )
+        except Exception:
+            pass
 
     async def _place_stop_order(self, signal: Signal, size_lots: int, entry_price: float):
         is_long = signal.type == SignalType.LONG
@@ -336,6 +349,14 @@ class ExecutionEngine:
         now = datetime.utcnow()
         self.risk.record_trade_close(trade, price, now)
         self.trade_logger.log(trade)
+        try:
+            send(
+                f"❌ EXIT {trade.side.upper()} {self.symbol}\n"
+                f"Exit Price: {trade.exit_price:.2f}\n"
+                f"PnL: {trade.realised_pnl:.2f}"
+            )
+        except Exception:
+            pass
         self._current_trade = None
 
         logger.info(
