@@ -178,6 +178,19 @@ class ExecutionEngine:
         await self.bootstrap_product()      # ← must come before bootstrap_history
         await self.bootstrap_history()
 
+        # ── Emergency: close any orphaned positions from previous restart ──
+        try:
+            positions = await self.rest.get_positions()
+            for pos in positions:
+                if pos.symbol == self.symbol and pos.size != 0:
+                    logger.warning(
+                        "Found orphaned position on restart: %s %.2f lots. Closing immediately.",
+                        self.symbol, pos.size,
+                    )
+                    await self._force_close_position(pos)
+        except Exception as exc:
+            logger.warning("Failed to check orphaned positions: %s", exc)
+
         while self._running:
             try:
                 await self._tick()
@@ -214,7 +227,21 @@ class ExecutionEngine:
                 self.risk.should_exit_by_tp(self.symbol, latest_price)
             )
             if exit_trade:
-                await self._execute_close(exit_trade, latest_price, reason="risk_mgr")
+                if exit_trade.stop_loss and latest_price <= exit_trade.stop_loss:
+                    logger.warning(
+                        "🛑 STOP-LOSS HIT: %s price=%.4f sl=%.4f",
+                        self.symbol, latest_price, exit_trade.stop_loss,
+                    )
+                    reason = "stop_loss"
+                elif exit_trade.take_profit and latest_price >= exit_trade.take_profit:
+                    logger.info(
+                        "💰 TAKE-PROFIT HIT: %s price=%.4f tp=%.4f",
+                        self.symbol, latest_price, exit_trade.take_profit,
+                    )
+                    reason = "take_profit"
+                else:
+                    reason = "risk_mgr"
+                await self._execute_close(exit_trade, latest_price, reason=reason)
                 return
 
         # ── Generate signal ───────────────────
@@ -358,6 +385,35 @@ class ExecutionEngine:
             logger.info("Stop-loss order placed @ %.4f", signal.stop_loss)
         except Exception as exc:
             logger.warning("Stop order failed (will manage in software): %s", exc)
+
+    async def _force_close_position(self, position: "Position"):
+        """Emergency close for orphaned positions after restart."""
+        close_side = OrderSide.SELL if position.size > 0 else OrderSide.BUY
+        close_size = int(abs(position.size))
+        order = Order(
+            product_id=position.product_id,
+            side=close_side,
+            order_type=OrderType.MARKET,
+            size=close_size,
+            reduce_only=True,
+        )
+        try:
+            result = await self.rest.place_order(order)
+            logger.error(
+                "🚨 EMERGENCY CLOSE: %s %d lots @ market (restart recovery) → order_id=%s",
+                self.symbol, close_size, result.order_id,
+            )
+            try:
+                send(
+                    f"🚨 EMERGENCY CLOSE (restart recovery)\n"
+                    f"Symbol: {self.symbol}\n"
+                    f"Size: {close_size} lots\n"
+                    f"Order ID: {result.order_id}"
+                )
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.error("Emergency close failed: %s", exc)
 
     async def _execute_close(self, trade: TradeRecord, price: float, reason: str):
         close_side = OrderSide.SELL if trade.side == "long" else OrderSide.BUY
