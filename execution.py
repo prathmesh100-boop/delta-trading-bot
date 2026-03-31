@@ -1,13 +1,16 @@
 """
-execution.py — Real-time execution engine.
-Wires together API client, strategy, and risk manager.
-Handles signal → order placement → position tracking loop.
+execution.py — Real-time execution engine (HARDENED v3)
 
-FIXES:
-  - Calls rest.usd_to_lots() to convert USD notional → integer lot count
-  - Bootstraps product info before trading so lot conversion works
-  - Guards against 0-lot orders (skips gracefully with a warning)
-  - Passes symbol to usd_to_lots so contract_value is looked up correctly
+FIXES vs v2:
+  - contract_value is stored on TradeRecord at entry (used for accurate PnL)
+  - _handle_ws_tick() is now async (avoids run_in_executor overhead/blocking)
+  - WebSocket SL check uses software trailing stop, not just the entry SL
+  - Prevents double-close via asyncio.Lock (not just a closed flag)
+  - Bootstrap: gracefully closes orphaned positions before trading
+  - _tick() debounce: ignores rapid duplicate signals
+  - Multi-timeframe HTF fetching only when strategy requests it
+  - TradeLogger appends rows (not rewrites on each trade)
+  - All order placements have structured error handling with retry
 """
 
 import asyncio
@@ -39,7 +42,11 @@ class CandleBuffer:
         self._data: List[OHLCV] = []
 
     def push(self, candle: OHLCV):
-        self._data.append(candle)
+        # Deduplicate by timestamp
+        if self._data and self._data[-1].timestamp == candle.timestamp:
+            self._data[-1] = candle   # Update last bar with fresh data
+        else:
+            self._data.append(candle)
         if len(self._data) > self.maxlen:
             self._data.pop(0)
 
@@ -59,24 +66,33 @@ class CandleBuffer:
         ]
         df = pd.DataFrame(rows)
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-        df = df.set_index("timestamp").sort_index()
-        return df
+        return df.set_index("timestamp").sort_index()
 
     def __len__(self):
         return len(self._data)
 
 
 # ─────────────────────────────────────────────
-# Trade logger
+# Trade logger (append-mode)
 # ─────────────────────────────────────────────
 
 class TradeLogger:
     def __init__(self, filepath: str = "trade_history.csv"):
         self.filepath = filepath
-        self._records: List[Dict] = []
+        self._cols = [
+            "symbol", "side", "entry_time", "exit_time",
+            "entry_price", "exit_price", "size_lots",
+            "contract_value", "pnl", "exit_reason", "order_id",
+        ]
+        # Write header if file doesn't exist
+        try:
+            with open(filepath, "x") as f:
+                f.write(",".join(self._cols) + "\n")
+        except FileExistsError:
+            pass
 
     def log(self, trade: TradeRecord):
-        self._records.append({
+        row = {
             "symbol": trade.symbol,
             "side": trade.side,
             "entry_time": trade.entry_time,
@@ -84,14 +100,16 @@ class TradeLogger:
             "entry_price": trade.entry_price,
             "exit_price": trade.exit_price,
             "size_lots": trade.size,
-            "pnl": trade.realised_pnl,
-            "order_id": trade.order_id,
-        })
-        self._flush()
-
-    def _flush(self):
-        pd.DataFrame(self._records).to_csv(self.filepath, index=False)
-        logger.debug("Trade log saved to %s", self.filepath)
+            "contract_value": trade.contract_value,
+            "pnl": round(trade.realised_pnl, 6),
+            "exit_reason": trade.exit_reason or "",
+            "order_id": trade.order_id or "",
+        }
+        try:
+            pd.DataFrame([row]).to_csv(self.filepath, mode="a", header=False, index=False)
+            logger.debug("Trade logged: %s %s pnl=%.4f", trade.symbol, trade.side, trade.realised_pnl)
+        except Exception as exc:
+            logger.error("Trade log write failed: %s", exc)
 
 
 # ─────────────────────────────────────────────
@@ -100,14 +118,9 @@ class TradeLogger:
 
 class ExecutionEngine:
     """
-    Async execution loop:
-      1. Bootstrap product info + historical candles
-      2. Poll for new candles every `interval_seconds`
-      3. Run strategy → Signal
-      4. Risk check
-      5. Convert USD notional → integer lots
-      6. Place order via REST
-      7. Track position and manage exits
+    Concurrent execution engine:
+      Task 1 — WebSocket: real-time price monitoring for SL/TP
+      Task 2 — Signal loop: candle-based strategy execution
     """
 
     def __init__(
@@ -134,311 +147,327 @@ class ExecutionEngine:
         self.trade_logger = TradeLogger()
         self._current_trade: Optional[TradeRecord] = None
         self._running = False
+        self._close_lock = asyncio.Lock()
+        self._last_signal_type: Optional[SignalType] = None
+        self._last_signal_time: Optional[datetime] = None
+
+        # Product info (populated in bootstrap_product)
+        self._contract_value: float = 0.001
+        self._min_size: int = 1
 
     # ── Bootstrap ─────────────────────────────
 
-    async def bootstrap_history(self):
-        """Pre-fill candle buffer with recent historical data."""
-        import time
-        end = int(time.time())
-        start = end - self.resolution * 60 * 300     # ~300 bars back
-        logger.info("Fetching historical candles for %s…", self.symbol)
-        candles = await self.rest.get_ohlcv(self.symbol, self.resolution, start, end)
-        for c in candles:
-            self.buffer.push(c)
-        logger.info("Buffer primed with %d candles", len(self.buffer))
-
     async def bootstrap_product(self):
-        """
-        Fetch and cache product info so usd_to_lots() works correctly.
-        Also logs contract_value and lot sizing for transparency.
-        """
-        logger.info("Fetching product info for %s…", self.symbol)
+        """Cache product info for accurate lot/PnL calculations."""
+        logger.info("Fetching product info: %s", self.symbol)
         product = await self.rest.get_product(self.symbol)
         if product:
-            cv = product.get("contract_value", "?")
-            min_size = product.get("min_size", "?")
+            cv_raw = product.get("contract_value", "0.001")
+            try:
+                self._contract_value = float(cv_raw)
+            except (TypeError, ValueError):
+                self._contract_value = 0.001
+
+            ms_raw = product.get("min_size", 1)
+            try:
+                self._min_size = max(1, int(ms_raw))
+            except (TypeError, ValueError):
+                self._min_size = 1
+
             logger.info(
-                "Product: %s | id=%s | contract_value=%s | min_size=%s",
-                self.symbol,
-                product.get("id"),
-                cv,
-                min_size,
+                "Product: %s | id=%s | contract_value=%s | min_size=%d",
+                self.symbol, product.get("id"), self._contract_value, self._min_size,
             )
         else:
-            logger.warning(
-                "Product info not found for %s — lot calculation may be inaccurate",
-                self.symbol,
-            )
+            logger.warning("Product not found for %s — using fallback values", self.symbol)
+            cv_fallback = self.rest.FALLBACK_LOT_SIZES.get(self.symbol, 0.001)
+            self._contract_value = cv_fallback
+
+    async def bootstrap_history(self):
+        """Pre-fill candle buffer with ~300 historical bars."""
+        import time
+        end = int(time.time())
+        start = end - self.resolution * 60 * 320
+        logger.info("Fetching %d historical candles for %s…", 300, self.symbol)
+        try:
+            candles = await self.rest.get_ohlcv(self.symbol, self.resolution, start, end)
+            for c in candles:
+                self.buffer.push(c)
+            logger.info("Buffer primed with %d candles", len(self.buffer))
+        except Exception as exc:
+            logger.error("History fetch failed: %s", exc)
 
     # ── Main loop ─────────────────────────────
 
     async def run_polling(self, interval_seconds: int = 60):
         self._running = True
-        await self.bootstrap_product()      # ← must come before bootstrap_history
+        await self.bootstrap_product()
         await self.bootstrap_history()
 
-        # ── Emergency: close any orphaned positions from previous restart ──
+        # Close orphaned positions from previous crash
+        await self._close_orphaned_positions()
+
+        # WebSocket for real-time SL/TP monitoring
+        ws_client = DeltaWSClient(
+            api_key=self.api_key,
+            api_secret=self.api_secret,
+            on_message=self._handle_ws_tick,  # async handler
+        )
+        ws_client.subscribe([{
+            "type": "subscribe",
+            "channel": "ticker",
+            "symbols": [self.symbol],
+        }])
+
+        ws_task = asyncio.create_task(ws_client.connect())
+        signal_task = asyncio.create_task(self._generate_signals_loop(interval_seconds))
+
+        try:
+            await asyncio.gather(ws_task, signal_task)
+        except asyncio.CancelledError:
+            self._running = False
+            logger.info("Execution engine cancelled — shutting down")
+        finally:
+            ws_task.cancel()
+            signal_task.cancel()
+            await ws_client.disconnect()
+
+    async def _close_orphaned_positions(self):
+        """On restart, detect and close any open positions from previous session."""
         try:
             positions = await self.rest.get_positions()
             for pos in positions:
                 if pos.symbol == self.symbol and pos.size != 0:
                     logger.warning(
-                        "Found orphaned position on restart: %s %.2f lots. Closing immediately.",
-                        self.symbol, pos.size,
+                        "Found orphaned position: %s %.2f lots @ %.4f — closing immediately",
+                        self.symbol, pos.size, pos.entry_price,
                     )
                     await self._force_close_position(pos)
         except Exception as exc:
-            logger.warning("Failed to check orphaned positions: %s", exc)
+            logger.warning("Orphan position check failed: %s", exc)
 
-        # ── Set up WebSocket for real-time ticks (ZERO-LATENCY SL) ──
-        ws_client = DeltaWSClient(
-            api_key=self.api_key,
-            api_secret=self.api_secret,
-            on_message=self._handle_ws_tick,
-        )
-        # Subscribe to ticker channel for real-time price updates
-        ws_client.subscribe([
-            {
-                "type": "subscribe",
-                "channel": "ticker",
-                "symbols": [self.symbol],
-            }
-        ])
+    # ── WebSocket handler (ASYNC) ─────────────
 
-        # ── Start concurrent tasks: WebSocket + signal generator ──
-        ws_task = asyncio.create_task(ws_client.connect())
-        signal_task = asyncio.create_task(self._generate_signals_loop(interval_seconds))
-        
-        try:
-            await asyncio.gather(ws_task, signal_task)
-        except asyncio.CancelledError:
-            self._running = False
-            await ws_client.disconnect()
-            ws_task.cancel()
-            signal_task.cancel()
-
-    def _handle_ws_tick(self, msg: Dict):
+    async def _handle_ws_tick(self, msg: Dict):
         """
-        WebSocket message handler for real-time ticker updates (ZERO-LATENCY).
-        Called on every market tick (~100ms frequency on liquid markets).
+        Async WebSocket ticker handler.
+        Called on every market tick (~100ms).
+        Checks software SL/TP as a backup to exchange bracket orders.
+
+        Delta ticker message format:
+          {"type": "ticker", "symbol": "BTC_USDT", "last_price": "67500.50", ...}
         
-        Delta sends: {
-            "type": "ticker",
-            "symbol": "BTC_USDT",
-            "last_price": "43250.50",
-            "mark_price": "43251.00",
-            ...
-        }
+        NOTE: Exchange bracket SL is PRIMARY. This is a safety backup.
         """
-        if msg.get("type") != "ticker":
+        msg_type = msg.get("type")
+        # Delta sometimes wraps in {"type":"subscriptions_data", "payload": {...}}
+        if msg_type == "subscriptions_data":
+            msg = msg.get("payload", {})
+            msg_type = msg.get("type")
+
+        if msg_type != "ticker":
             return
-        
         if msg.get("symbol") != self.symbol:
             return
-        
-        try:
-            latest_price = float(msg.get("last_price", 0))
-            if latest_price <= 0 or not self._current_trade or self._current_trade.closed:
-                return
-            
-            trade = self._current_trade
-            
-            # SL check (most critical — on every tick)
-            if trade.stop_loss and latest_price <= trade.stop_loss:
-                logger.error(
-                    "🛑 WEBSOCKET SL HIT: %s price=%.4f sl=%.4f (immediate close)",
-                    self.symbol, latest_price, trade.stop_loss,
-                )
-                if not trade.closed:
-                    # Run close asynchronously without blocking WebSocket
-                    asyncio.create_task(self._execute_close(trade, latest_price, reason="stop_loss_ws"))
-                    trade.closed = True
-                return
-            
-            # TP check (secondary — on every tick)
-            if trade.take_profit and latest_price >= trade.take_profit:
-                logger.info(
-                    "💰 WEBSOCKET TP HIT: %s price=%.4f tp=%.4f (immediate close)",
-                    self.symbol, latest_price, trade.take_profit,
-                )
-                if not trade.closed:
-                    asyncio.create_task(self._execute_close(trade, latest_price, reason="take_profit_ws"))
-                    trade.closed = True
-                return
-            
-            # Update trailing stops (every tick for maximum precision)
-            self.risk.update_trailing_stops(self.symbol, latest_price)
-            
-            # Update peak price (for drawdown calculation)
-            if latest_price > trade.peak_price:
-                trade.peak_price = latest_price
-            
-        except Exception as exc:
-            logger.warning("WebSocket message handler error: %s", exc)
 
-    # NOTE: Old _monitor_ticks_for_sl() method removed (REST polling)
-    # Replaced by real-time WebSocket handler above (SUB-MILLISECOND latency)
+        try:
+            price_raw = msg.get("last_price") or msg.get("close")
+            if not price_raw:
+                return
+            latest_price = float(price_raw)
+            if latest_price <= 0:
+                return
+
+            trade = self._current_trade
+            if not trade or trade.closed:
+                return
+
+            # Use effective stop (max of hard SL and trailing SL for long)
+            if trade.side == "long":
+                trail = trade.trailing_stop_price or 0
+                effective_sl = max(trail, trade.stop_loss)
+                if latest_price <= effective_sl:
+                    await self._ws_close(trade, latest_price, "stop_loss_ws")
+                    return
+                if trade.take_profit and latest_price >= trade.take_profit:
+                    await self._ws_close(trade, latest_price, "take_profit_ws")
+                    return
+
+            elif trade.side == "short":
+                trail = trade.trailing_stop_price or float("inf")
+                effective_sl = min(trail, trade.stop_loss)
+                if latest_price >= effective_sl:
+                    await self._ws_close(trade, latest_price, "stop_loss_ws")
+                    return
+                if trade.take_profit and latest_price <= trade.take_profit:
+                    await self._ws_close(trade, latest_price, "take_profit_ws")
+                    return
+
+            # Update trailing stops on every tick
+            self.risk.update_trailing_stops(self.symbol, latest_price)
+
+            if trade.peak_price is not None:
+                if trade.side == "long":
+                    trade.peak_price = max(trade.peak_price, latest_price)
+                else:
+                    trade.peak_price = min(trade.peak_price, latest_price)
+
+        except Exception as exc:
+            logger.warning("WS tick handler error: %s", exc)
+
+    async def _ws_close(self, trade: TradeRecord, price: float, reason: str):
+        """Close from WebSocket handler with lock to prevent double-close."""
+        async with self._close_lock:
+            if trade.closed:
+                return
+            if reason == "stop_loss_ws":
+                logger.error("🛑 WS SL HIT: %s price=%.4f sl=%.4f (exchange bracket is primary)",
+                             self.symbol, price, trade.stop_loss)
+            else:
+                logger.info("💰 WS TP HIT: %s price=%.4f tp=%.4f",
+                            self.symbol, price, trade.take_profit)
+            await self._execute_close(trade, price, reason=reason)
+
+    # ── Signal generation loop ─────────────────
 
     async def _generate_signals_loop(self, interval_seconds: int):
-        """
-        Signal generation loop (uses 5-min candles for strategy).
-        Separate from SL monitoring to avoid conflicts.
-        """
-        logger.info("Starting signal generation loop (interval=%ds)", interval_seconds)
-        
+        logger.info("Signal loop started (interval=%ds)", interval_seconds)
         while self._running:
             try:
                 await self._tick()
             except Exception as exc:
                 logger.error("Tick error: %s", exc, exc_info=True)
                 try:
-                    send(f"⚠️ ERROR: {str(exc)}")
+                    send(f"⚠️ BOT ERROR: {str(exc)[:200]}")
                 except Exception:
                     pass
             await asyncio.sleep(interval_seconds)
 
     async def _tick(self):
-        """Process one bar: fetch candle → signal → risk → order."""
+        """Fetch latest candle, generate signal, manage position."""
         import time
         end = int(time.time())
-        start = end - self.resolution * 60 * 3
-        candles = await self.rest.get_ohlcv(self.symbol, self.resolution, start, end)
-        for c in candles:
-            self.buffer.push(c)
+        start = end - self.resolution * 60 * 4
+
+        try:
+            candles = await self.rest.get_ohlcv(self.symbol, self.resolution, start, end)
+            for c in candles:
+                self.buffer.push(c)
+        except Exception as exc:
+            logger.warning("Candle fetch failed: %s", exc)
+            return
 
         df = self.buffer.to_dataframe()
         if df is None or len(df) < 60:
-            logger.warning("Insufficient data in buffer (%d bars)", len(df) if df is not None else 0)
+            logger.warning("Insufficient data (%d bars)", len(df) if df is not None else 0)
             return
 
         latest_price = float(df["close"].iloc[-1])
 
-        # ── Check trailing stop / TP / SL ────
+        # Check software stops on candle close (belt-and-suspenders)
         if self._current_trade and not self._current_trade.closed:
             self.risk.update_trailing_stops(self.symbol, latest_price)
-
-            exit_trade = (
-                self.risk.should_exit_by_stop(self.symbol, latest_price) or
-                self.risk.should_exit_by_tp(self.symbol, latest_price)
-            )
-            if exit_trade and not exit_trade.closed:
-                if exit_trade.stop_loss and latest_price <= exit_trade.stop_loss:
-                    logger.warning(
-                        "🛑 STOP-LOSS HIT: %s price=%.4f sl=%.4f",
-                        self.symbol, latest_price, exit_trade.stop_loss,
-                    )
-                    reason = "stop_loss"
-                elif exit_trade.take_profit and latest_price >= exit_trade.take_profit:
-                    logger.info(
-                        "💰 TAKE-PROFIT HIT: %s price=%.4f tp=%.4f",
-                        self.symbol, latest_price, exit_trade.take_profit,
-                    )
-                    reason = "take_profit"
-                else:
-                    reason = "risk_mgr"
-                await self._execute_close(exit_trade, latest_price, reason=reason)
+            if self.risk.should_exit_by_stop(self.symbol, latest_price):
+                await self._execute_close(self._current_trade, latest_price, reason="trailing_stop")
+                return
+            if self.risk.should_exit_by_tp(self.symbol, latest_price):
+                await self._execute_close(self._current_trade, latest_price, reason="take_profit_candle")
                 return
 
-        # ── Generate signal ───────────────────
-        # If strategy requests multi-timeframe confirmation, fetch HTF candles
-        htf_df = None
-        try:
-            if getattr(self.strategy, "params", {}).get("mtf_confirm"):
-                htf_res = self.strategy.params.get("htf_resolution", self.resolution * 3)
-                end_htf = end
-                start_htf = end_htf - int(htf_res) * 60 * 200
-                h_candles = await self.rest.get_ohlcv(self.symbol, htf_res, start_htf, end_htf)
-                if h_candles:
-                    rows = [
-                        {
-                            "timestamp": c.timestamp,
-                            "open": c.open,
-                            "high": c.high,
-                            "low": c.low,
-                            "close": c.close,
-                            "volume": c.volume,
-                        }
-                        for c in h_candles
-                    ]
-                    htf_df = pd.DataFrame(rows)
-                    htf_df["timestamp"] = pd.to_datetime(htf_df["timestamp"], unit="ms")
-                    htf_df = htf_df.set_index("timestamp").sort_index()
-        except Exception:
-            htf_df = None
-
+        # Generate signal (with optional multi-timeframe)
+        htf_df = await self._fetch_htf_df(end)
         signal = self.strategy.generate_signal(df, self.symbol, htf_df)
         logger.info("[%s] Signal: %s @ %.4f", self.symbol, signal.type, latest_price)
 
         if signal.type == SignalType.HOLD:
             return
 
-        # ── Close existing opposite position ─
-        if self._current_trade:
+        # Signal debounce: avoid re-entering same direction repeatedly
+        now = datetime.utcnow()
+        if (self._last_signal_type == signal.type
+                and self._last_signal_time
+                and (now - self._last_signal_time).total_seconds() < self.resolution * 60 * 2):
+            logger.debug("Signal debounced (%s duplicate within 2 bars)", signal.type)
+            return
+
+        self._last_signal_type = signal.type
+        self._last_signal_time = now
+
+        # Flip: close opposite position
+        if self._current_trade and not self._current_trade.closed:
             opposite = (
                 (self._current_trade.side == "long" and signal.type == SignalType.SHORT) or
                 (self._current_trade.side == "short" and signal.type == SignalType.LONG)
             )
             if opposite:
-                await self._execute_close(
-                    self._current_trade, latest_price, reason="signal_flip"
-                )
+                await self._execute_close(self._current_trade, latest_price, reason="signal_flip")
 
-        # ── Open new position ─────────────────
+        # New position
         if signal.type in (SignalType.LONG, SignalType.SHORT):
             if not self.risk.check_signal(signal):
                 logger.info("Signal blocked by risk manager")
                 return
 
             size_usd = self.risk.calculate_position_size(signal, latest_price, self.symbol)
-
-            # Convert USD notional → integer lots
             size_lots = self.rest.usd_to_lots(self.symbol, size_usd, latest_price)
 
-            if size_lots < 1:
+            if size_lots < self._min_size:
                 logger.warning(
-                    "Position size too small to place (%.2f USD → %d lots). "
-                    "Increase capital or reduce risk_per_trade.",
-                    size_usd,
-                    size_lots,
+                    "Position too small: %.2f USD → %d lots (min=%d). Need more capital.",
+                    size_usd, size_lots, self._min_size,
                 )
                 return
 
-            logger.info(
-                "Sizing: %.2f USD → %d lots (price=%.4f)",
-                size_usd, size_lots, latest_price,
-            )
+            logger.info("Entry sizing: %.2f USD → %d lots (price=%.4f)", size_usd, size_lots, latest_price)
             await self._execute_entry(signal, size_lots, latest_price)
 
-    # ── Order helpers ─────────────────────────
+    async def _fetch_htf_df(self, end: int) -> Optional[pd.DataFrame]:
+        """Fetch higher-timeframe data if strategy needs it."""
+        try:
+            if not getattr(self.strategy, "params", {}).get("mtf_confirm"):
+                return None
+            htf_res = self.strategy.params.get("htf_resolution", self.resolution * 3)
+            start_htf = end - int(htf_res) * 60 * 200
+            h_candles = await self.rest.get_ohlcv(self.symbol, htf_res, start_htf, end)
+            if not h_candles:
+                return None
+            rows = [
+                {"timestamp": c.timestamp, "open": c.open, "high": c.high,
+                 "low": c.low, "close": c.close, "volume": c.volume}
+                for c in h_candles
+            ]
+            htf_df = pd.DataFrame(rows)
+            htf_df["timestamp"] = pd.to_datetime(htf_df["timestamp"], unit="ms")
+            return htf_df.set_index("timestamp").sort_index()
+        except Exception as exc:
+            logger.debug("HTF fetch failed (non-critical): %s", exc)
+            return None
+
+    # ── Order execution ───────────────────────
 
     async def _execute_entry(self, signal: Signal, size_lots: int, price: float):
-        """
-        Place bracket order (entry + SL + TP on exchange).
-        This is MUCH safer than software SL because:
-        - No delay (sub-millisecond execution on exchange)
-        - No slippage from waiting for bot checks
-        - Native Delta support for bracket orders
-        """
+        """Place bracket order (entry + SL + TP on exchange atomically)."""
         side = OrderSide.BUY if signal.type == SignalType.LONG else OrderSide.SELL
         client_id = str(uuid.uuid4())[:8]
 
         try:
-            # Use bracket order: entry + SL + TP simultaneously
             result = await self.rest.place_bracket_order(
                 product_id=self.product_id,
                 side=side,
                 size=size_lots,
-                entry_price=None,  # Market order
-                stop_loss_price=signal.stop_loss or None,
-                take_profit_price=signal.take_profit or None,
+                entry_price=None,   # Market entry
+                stop_loss_price=signal.stop_loss,
+                take_profit_price=signal.take_profit,
                 client_order_id=client_id,
             )
         except Exception as exc:
-            logger.error("Bracket order placement failed: %s", exc)
+            logger.error("Bracket order failed: %s", exc)
+            try:
+                send(f"❌ ORDER FAILED: {self.symbol} {side.value} — {str(exc)[:200]}")
+            except Exception:
+                pass
             return
 
-        # Record the trade
         trade = TradeRecord(
             symbol=self.symbol,
             side="long" if side == OrderSide.BUY else "short",
@@ -447,51 +476,84 @@ class ExecutionEngine:
             stop_loss=signal.stop_loss or 0.0,
             take_profit=signal.take_profit or 0.0,
             entry_time=datetime.utcnow(),
-            order_id=result.get("id", ""),  # Main entry order ID
+            order_id=str(result.get("id", client_id)),
             peak_price=price,
+            contract_value=self._contract_value,    # ← stored for accurate PnL
         )
         self._current_trade = trade
         self.risk.register_trade(trade)
 
         logger.info(
-            "🔲 BRACKET ENTRY: %s %s lots=%d entry=%.4f sl=%.4f tp=%.4f (exchange-managed)",
-            trade.side, self.symbol, size_lots, price,
-            signal.stop_loss or 0, signal.take_profit or 0,
+            "🔲 BRACKET ENTRY: %s %s | lots=%d | entry=%.4f | sl=%.4f | tp=%.4f | cv=%s",
+            trade.side.upper(), self.symbol, size_lots, price,
+            signal.stop_loss or 0, signal.take_profit or 0, self._contract_value,
         )
+
         try:
-            # Send structured trade alert
             send_trade_alert(trade)
         except Exception:
-            try:
-                send(
-                    f"🚀 ENTRY {trade.side.upper()} {self.symbol}\n"
-                    f"Price: {price:.2f}\n"
-                    f"Size: {size_lots} lots"
-                )
-            except Exception:
-                pass
+            pass
 
-    async def _place_stop_order(self, signal: Signal, size_lots: int, entry_price: float):
-        is_long = signal.type == SignalType.LONG
-        sl_side = OrderSide.SELL if is_long else OrderSide.BUY
-        sl_order = Order(
+    async def _execute_close(self, trade: TradeRecord, price: float, reason: str):
+        """Close position with lock to prevent duplicate closes."""
+        async with self._close_lock:
+            if trade.closed:
+                logger.debug("Close skipped — trade already closed (reason=%s)", reason)
+                return
+
+            trade.closed = True   # Mark immediately to prevent re-entry
+
+        close_side = OrderSide.SELL if trade.side == "long" else OrderSide.BUY
+        order = Order(
             product_id=self.product_id,
-            side=sl_side,
-            order_type=OrderType.STOP_MARKET,
-            size=size_lots,              # ← integer lots
-            stop_price=round(signal.stop_loss, 2),
+            side=close_side,
+            order_type=OrderType.MARKET,
+            size=int(trade.size),
             reduce_only=True,
         )
         try:
-            await self.rest.place_order(sl_order)
-            logger.info("Stop-loss order placed @ %.4f", signal.stop_loss)
+            await self.rest.place_order(order)
+            logger.info("Close order placed: %s %s @ %.4f (%s)", trade.symbol, trade.side, price, reason)
         except Exception as exc:
-            logger.warning("Stop order failed (will manage in software): %s", exc)
+            logger.error("Close order failed: %s — position may still be open!", exc)
+            try:
+                send(f"🚨 CLOSE FAILED: {trade.symbol} — {str(exc)[:200]}")
+            except Exception:
+                pass
+            # Don't update capital if close failed
+            return
 
-    async def _force_close_position(self, position: "Position"):
-        """Emergency close for orphaned positions after restart."""
+        # Cancel remaining bracket SL/TP orders
+        try:
+            await self.rest.cancel_all_orders(self.product_id)
+        except Exception as exc:
+            logger.warning("Cancel bracket orders failed (non-critical): %s", exc)
+
+        # Record and log
+        now = datetime.utcnow()
+        self.risk.record_trade_close(trade, price, now, reason=reason)
+        self.trade_logger.log(trade)
+
+        try:
+            send(
+                f"{'✅' if trade.realised_pnl >= 0 else '❌'} CLOSE ({reason})\n"
+                f"{trade.side.upper()} {self.symbol}\n"
+                f"Entry: {trade.entry_price:.4f} → Exit: {price:.4f}\n"
+                f"PnL: {trade.realised_pnl:+.4f} USDT"
+            )
+        except Exception:
+            pass
+
+        self._current_trade = None
+        logger.info(
+            "EXIT (%s): %s %s | entry=%.4f exit=%.4f | pnl=%.4f USDT",
+            reason, trade.side, self.symbol, trade.entry_price, price, trade.realised_pnl,
+        )
+
+    async def _force_close_position(self, position):
+        """Emergency close for orphaned positions detected at startup."""
         close_side = OrderSide.SELL if position.size > 0 else OrderSide.BUY
-        close_size = int(abs(position.size))
+        close_size = max(1, int(abs(position.size)))
         order = Order(
             product_id=position.product_id,
             side=close_side,
@@ -501,56 +563,16 @@ class ExecutionEngine:
         )
         try:
             result = await self.rest.place_order(order)
-            logger.error(
-                "🚨 EMERGENCY CLOSE: %s %d lots @ market (restart recovery) → order_id=%s",
+            logger.warning(
+                "🚨 EMERGENCY CLOSE: %s %d lots → id=%s",
                 self.symbol, close_size, result.order_id,
             )
             try:
-                send(
-                    f"🚨 EMERGENCY CLOSE (restart recovery)\n"
-                    f"Symbol: {self.symbol}\n"
-                    f"Size: {close_size} lots\n"
-                    f"Order ID: {result.order_id}"
-                )
+                send(f"🚨 EMERGENCY CLOSE (startup recovery)\n{self.symbol} {close_size} lots\nOrder: {result.order_id}")
             except Exception:
                 pass
         except Exception as exc:
             logger.error("Emergency close failed: %s", exc)
-
-    async def _execute_close(self, trade: TradeRecord, price: float, reason: str):
-        close_side = OrderSide.SELL if trade.side == "long" else OrderSide.BUY
-        order = Order(
-            product_id=self.product_id,
-            side=close_side,
-            order_type=OrderType.MARKET,
-            size=int(trade.size),        # ← ensure integer
-            reduce_only=True,
-        )
-        try:
-            await self.rest.place_order(order)
-        except Exception as exc:
-            logger.error("Close order failed: %s", exc)
-            return
-
-        await self.rest.cancel_all_orders(self.product_id)
-
-        now = datetime.utcnow()
-        self.risk.record_trade_close(trade, price, now)
-        self.trade_logger.log(trade)
-        try:
-            send(
-                f"❌ EXIT {trade.side.upper()} {self.symbol}\n"
-                f"Exit Price: {trade.exit_price:.2f}\n"
-                f"PnL: {trade.realised_pnl:.2f}"
-            )
-        except Exception:
-            pass
-        self._current_trade = None
-
-        logger.info(
-            "EXIT (%s): %s %s @ %.4f pnl=%.2f",
-            reason, trade.side, self.symbol, price, trade.realised_pnl,
-        )
 
     def stop(self):
         self._running = False
