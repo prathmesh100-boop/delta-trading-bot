@@ -219,14 +219,14 @@ class ExecutionEngine:
         latest_price = float(df["close"].iloc[-1])
 
         # ── Check trailing stop / TP / SL ────
-        if self._current_trade:
+        if self._current_trade and not self._current_trade.closed:
             self.risk.update_trailing_stops(self.symbol, latest_price)
 
             exit_trade = (
                 self.risk.should_exit_by_stop(self.symbol, latest_price) or
                 self.risk.should_exit_by_tp(self.symbol, latest_price)
             )
-            if exit_trade:
+            if exit_trade and not exit_trade.closed:
                 if exit_trade.stop_loss and latest_price <= exit_trade.stop_loss:
                     logger.warning(
                         "🛑 STOP-LOSS HIT: %s price=%.4f sl=%.4f",
@@ -348,11 +348,13 @@ class ExecutionEngine:
         self._current_trade = trade
         self.risk.register_trade(trade)
 
-        if signal.stop_loss:
-            await self._place_stop_order(signal, size_lots, price)
+        # NOTE: Delta doesn't support STOP_MARKET orders, so we skip exchange stop placement
+        # and rely entirely on software-based SL/TP management (checked every tick)
+        # if signal.stop_loss:
+        #     await self._place_stop_order(signal, size_lots, price)
 
         logger.info(
-            "ENTRY: %s %s lots=%d entry=%.4f sl=%.4f tp=%.4f",
+            "ENTRY: %s %s lots=%d entry=%.4f sl=%.4f tp=%.4f (SL managed by software)",
             trade.side, self.symbol, size_lots, price,
             signal.stop_loss or 0, signal.take_profit or 0,
         )

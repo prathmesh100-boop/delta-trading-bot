@@ -27,23 +27,26 @@ logger = logging.getLogger(__name__)
 @dataclass
 class RiskConfig:
     # Position sizing
-    risk_per_trade: float = 0.01          # 1% of capital per trade
+    risk_per_trade: float = 0.02          # 2% of capital per trade (increased from 1% for better entries)
     max_position_size_pct: float = 0.20   # never use more than 20% of capital (with leverage)
     leverage: float = 1.0                 # match the leverage set on Delta Exchange
     leverage_by_symbol: Dict[str, float] = field(default_factory=lambda: {
-        "BTC_USDT": 10.0,
-        "ETH_USDT": 20.0,
-        "SOL_USDT": 15.0,
+        "BTC_USDT": 10.0,                 # Conservative for BTC
+        "BTCUSD": 10.0,
+        "ETH_USDT": 10.0,                 # REDUCED from 20x (was too aggressive)
+        "ETHUSD": 10.0,
+        "SOL_USDT": 10.0,                 # REDUCED from 15x (was too aggressive)
+        "SOLUSD": 10.0,
     })
 
     # Portfolio limits
-    max_open_trades: int = 1              # conservative: 1 at a time for small accounts
+    max_open_trades: int = 2              # Allow max 2 positions (balanced)
     max_correlated_exposure: float = 0.10
 
     # Drawdown / loss limits
-    max_drawdown_pct: float = 0.10        # 10% drawdown → halt
-    daily_loss_limit_pct: float = 0.05   # 5% daily loss → pause
-    weekly_loss_limit_pct: float = 0.10
+    max_drawdown_pct: float = 0.15        # 15% drawdown → halt (more reasonable for small accounts)
+    daily_loss_limit_pct: float = 0.10    # 10% daily loss → pause (allows recovery)
+    weekly_loss_limit_pct: float = 0.20
 
     # Trailing stop
     trailing_stop_pct: float = 0.02       # 2% from peak

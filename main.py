@@ -118,12 +118,12 @@ async def cmd_trade(args):
 
     strategy = load_strategy(args.strategy)
     risk_cfg = RiskConfig(
-        risk_per_trade=0.01,
-        max_drawdown_pct=0.10,
-        max_open_trades=2, 
-        daily_loss_limit_pct=0.05,
+        risk_per_trade=0.02,               # 2% per trade (increased for better entries)
+        max_drawdown_pct=0.15,             # 15% drawdown halt (recovery margin)
+        max_open_trades=2,                 # Allow 2 positions (balanced)
+        daily_loss_limit_pct=0.10,         # 10% daily loss halt
         leverage=float(args.leverage),
-        max_position_size_pct=0.30,      # allow up to 30% of capital per trade with leverage
+        max_position_size_pct=0.30,        # allow up to 30% of capital per trade with leverage
         breakeven_trigger_pct=float(getattr(args, "breakeven_trigger_pct", 0.005)),
         breakeven_buffer=float(getattr(args, "breakeven_buffer", 0.0)),
         profit_lock_threshold_pct=float(getattr(args, "profit_lock_threshold_pct", 0.01)),
