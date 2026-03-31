@@ -191,72 +191,94 @@ class ExecutionEngine:
         except Exception as exc:
             logger.warning("Failed to check orphaned positions: %s", exc)
 
-        # ── Start concurrent tasks: tick monitor + signal generator ──
-        tick_task = asyncio.create_task(self._monitor_ticks_for_sl())
+        # ── Set up WebSocket for real-time ticks (ZERO-LATENCY SL) ──
+        ws_client = DeltaWSClient(
+            api_key=self.api_key,
+            api_secret=self.api_secret,
+            on_message=self._handle_ws_tick,
+        )
+        # Subscribe to ticker channel for real-time price updates
+        ws_client.subscribe([
+            {
+                "type": "subscribe",
+                "channel": "ticker",
+                "symbols": [self.symbol],
+            }
+        ])
+
+        # ── Start concurrent tasks: WebSocket + signal generator ──
+        ws_task = asyncio.create_task(ws_client.connect())
         signal_task = asyncio.create_task(self._generate_signals_loop(interval_seconds))
         
         try:
-            await asyncio.gather(tick_task, signal_task)
+            await asyncio.gather(ws_task, signal_task)
         except asyncio.CancelledError:
             self._running = False
-            tick_task.cancel()
+            await ws_client.disconnect()
+            ws_task.cancel()
             signal_task.cancel()
 
-    async def _monitor_ticks_for_sl(self):
+    def _handle_ws_tick(self, msg: Dict):
         """
-        Real-time price monitoring via REST polling (fast checks).
-        Checks SL/TP every 2 seconds instead of waiting for 5-minute candle.
+        WebSocket message handler for real-time ticker updates (ZERO-LATENCY).
+        Called on every market tick (~100ms frequency on liquid markets).
         
-        ⚠️ CRITICAL: This prevents slippage on SL triggers.
+        Delta sends: {
+            "type": "ticker",
+            "symbol": "BTC_USDT",
+            "last_price": "43250.50",
+            "mark_price": "43251.00",
+            ...
+        }
         """
-        logger.info("Starting real-time SL monitor for %s (2-sec check interval)", self.symbol)
+        if msg.get("type") != "ticker":
+            return
         
-        while self._running:
-            try:
-                if not self._current_trade or self._current_trade.closed:
-                    await asyncio.sleep(2)
-                    continue
-                
-                # Fetch latest tick price
-                ticker = await self.rest.get_ticker(self.symbol)
-                latest_price = float(ticker.get("last_price", 0))
-                
-                if latest_price <= 0:
-                    await asyncio.sleep(2)
-                    continue
-                
-                # Check SL/TP against CURRENT PRICE (not candle close)
-                trade = self._current_trade
-                
-                # SL check (most critical)
-                if trade.stop_loss and latest_price <= trade.stop_loss:
-                    logger.error(
-                        "🛑 REAL-TIME SL HIT: %s price=%.4f sl=%.4f (immediate close)",
-                        self.symbol, latest_price, trade.stop_loss,
-                    )
-                    if not trade.closed:
-                        await self._execute_close(trade, latest_price, reason="stop_loss_realtime")
-                        self._current_trade.closed = True
-                    continue
-                
-                # TP check (secondary)
-                if trade.take_profit and latest_price >= trade.take_profit:
-                    logger.info(
-                        "💰 REAL-TIME TP HIT: %s price=%.4f tp=%.4f (immediate close)",
-                        self.symbol, latest_price, trade.take_profit,
-                    )
-                    if not trade.closed:
-                        await self._execute_close(trade, latest_price, reason="take_profit_realtime")
-                        self._current_trade.closed = True
-                    continue
-                
-                # Update trailing stop (every tick)
-                self.risk.update_trailing_stops(self.symbol, latest_price)
-                
-            except Exception as exc:
-                logger.warning("SL monitor error: %s", exc)
+        if msg.get("symbol") != self.symbol:
+            return
+        
+        try:
+            latest_price = float(msg.get("last_price", 0))
+            if latest_price <= 0 or not self._current_trade or self._current_trade.closed:
+                return
             
-            await asyncio.sleep(2)  # Check every 2 seconds
+            trade = self._current_trade
+            
+            # SL check (most critical — on every tick)
+            if trade.stop_loss and latest_price <= trade.stop_loss:
+                logger.error(
+                    "🛑 WEBSOCKET SL HIT: %s price=%.4f sl=%.4f (immediate close)",
+                    self.symbol, latest_price, trade.stop_loss,
+                )
+                if not trade.closed:
+                    # Run close asynchronously without blocking WebSocket
+                    asyncio.create_task(self._execute_close(trade, latest_price, reason="stop_loss_ws"))
+                    trade.closed = True
+                return
+            
+            # TP check (secondary — on every tick)
+            if trade.take_profit and latest_price >= trade.take_profit:
+                logger.info(
+                    "💰 WEBSOCKET TP HIT: %s price=%.4f tp=%.4f (immediate close)",
+                    self.symbol, latest_price, trade.take_profit,
+                )
+                if not trade.closed:
+                    asyncio.create_task(self._execute_close(trade, latest_price, reason="take_profit_ws"))
+                    trade.closed = True
+                return
+            
+            # Update trailing stops (every tick for maximum precision)
+            self.risk.update_trailing_stops(self.symbol, latest_price)
+            
+            # Update peak price (for drawdown calculation)
+            if latest_price > trade.peak_price:
+                trade.peak_price = latest_price
+            
+        except Exception as exc:
+            logger.warning("WebSocket message handler error: %s", exc)
+
+    # NOTE: Old _monitor_ticks_for_sl() method removed (REST polling)
+    # Replaced by real-time WebSocket handler above (SUB-MILLISECOND latency)
 
     async def _generate_signals_loop(self, interval_seconds: int):
         """
