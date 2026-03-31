@@ -391,23 +391,32 @@ class ExecutionEngine:
     # ── Order helpers ─────────────────────────
 
     async def _execute_entry(self, signal: Signal, size_lots: int, price: float):
+        """
+        Place bracket order (entry + SL + TP on exchange).
+        This is MUCH safer than software SL because:
+        - No delay (sub-millisecond execution on exchange)
+        - No slippage from waiting for bot checks
+        - Native Delta support for bracket orders
+        """
         side = OrderSide.BUY if signal.type == SignalType.LONG else OrderSide.SELL
         client_id = str(uuid.uuid4())[:8]
 
-        order = Order(
-            product_id=self.product_id,
-            side=side,
-            order_type=OrderType.MARKET,
-            size=size_lots,              # ← integer lots
-            client_order_id=client_id,
-        )
-
         try:
-            order = await self.rest.place_order(order)
+            # Use bracket order: entry + SL + TP simultaneously
+            result = await self.rest.place_bracket_order(
+                product_id=self.product_id,
+                side=side,
+                size=size_lots,
+                entry_price=None,  # Market order
+                stop_loss_price=signal.stop_loss or None,
+                take_profit_price=signal.take_profit or None,
+                client_order_id=client_id,
+            )
         except Exception as exc:
-            logger.error("Order placement failed: %s", exc)
+            logger.error("Bracket order placement failed: %s", exc)
             return
 
+        # Record the trade
         trade = TradeRecord(
             symbol=self.symbol,
             side="long" if side == OrderSide.BUY else "short",
@@ -416,19 +425,14 @@ class ExecutionEngine:
             stop_loss=signal.stop_loss or 0.0,
             take_profit=signal.take_profit or 0.0,
             entry_time=datetime.utcnow(),
-            order_id=order.order_id,
+            order_id=result.get("id", ""),  # Main entry order ID
             peak_price=price,
         )
         self._current_trade = trade
         self.risk.register_trade(trade)
 
-        # NOTE: Delta doesn't support STOP_MARKET orders, so we skip exchange stop placement
-        # and rely entirely on software-based SL/TP management (checked every tick)
-        # if signal.stop_loss:
-        #     await self._place_stop_order(signal, size_lots, price)
-
         logger.info(
-            "ENTRY: %s %s lots=%d entry=%.4f sl=%.4f tp=%.4f (SL managed by software)",
+            "🔲 BRACKET ENTRY: %s %s lots=%d entry=%.4f sl=%.4f tp=%.4f (exchange-managed)",
             trade.side, self.symbol, size_lots, price,
             signal.stop_loss or 0, signal.take_profit or 0,
         )

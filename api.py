@@ -453,6 +453,77 @@ class DeltaRESTClient:
         logger.info("Order placed — id=%s status=%s", order.order_id, order.status)
         return order
 
+    async def place_bracket_order(
+        self,
+        product_id: int,
+        side: OrderSide,
+        size: int,
+        entry_price: Optional[float] = None,
+        stop_loss_price: Optional[float] = None,
+        take_profit_price: Optional[float] = None,
+        client_order_id: Optional[str] = None,
+    ) -> Dict:
+        """
+        Place a bracket order: entry + SL + TP all at once (native Delta support).
+        
+        This is MUCH safer than software SL because:
+        - SL executes on exchange immediately (no delay)
+        - No slippage waiting for bot checks
+        - Zero counterparty risk
+        
+        Args:
+            product_id: Delta product ID
+            side: OrderSide.BUY or OrderSide.SELL
+            size: Number of lots
+            entry_price: Limit price for entry (None = market)
+            stop_loss_price: SL trigger price
+            take_profit_price: TP trigger price
+            client_order_id: Optional client order ID
+        
+        Returns:
+            Response from Delta API with order IDs
+        """
+        payload: Dict[str, Any] = {
+            "product_id": product_id,
+            "side": side.value,
+            "order_type": "market_order",
+            "size": size,
+            "time_in_force": "gtc",
+            "bracket_order": {}
+        }
+        
+        if entry_price is not None:
+            payload["order_type"] = "limit_order"
+            payload["limit_price"] = str(round(entry_price, 2))
+        
+        if stop_loss_price is not None:
+            payload["bracket_order"]["sl_order_type"] = "limit_order"
+            payload["bracket_order"]["sl_trigger_price"] = str(round(stop_loss_price, 2))
+        
+        if take_profit_price is not None:
+            payload["bracket_order"]["tp_order_type"] = "limit_order"
+            payload["bracket_order"]["tp_trigger_price"] = str(round(take_profit_price, 2))
+        
+        if client_order_id:
+            payload["client_order_id"] = client_order_id
+        
+        logger.info(
+            "🔲 Placing BRACKET order: %s %d lots entry=%.4f sl=%.4f tp=%.4f",
+            side.value.upper(), size, entry_price or 0, stop_loss_price or 0, take_profit_price or 0,
+        )
+        
+        try:
+            resp = await self._request("POST", "/v2/orders", data=payload)
+            result = resp.get("result", {})
+            logger.info(
+                "Bracket order placed — entry_id=%s sl_id=%s tp_id=%s",
+                result.get("id"), result.get("sl_order_id"), result.get("tp_order_id"),
+            )
+            return result
+        except Exception as exc:
+            logger.error("Bracket order placement failed: %s", exc)
+            raise
+
     async def cancel_order(self, order_id: str, product_id: int) -> bool:
         payload = {"id": order_id, "product_id": product_id}
         try:
