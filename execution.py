@@ -364,15 +364,11 @@ class ExecutionEngine:
 
         latest_price = float(df["close"].iloc[-1])
 
-        # Check software stops on candle close (belt-and-suspenders)
+        # ⚠️ REMOVED: Candle-based TP/SL exits
+        # Exchange bracket orders are PRIMARY. WebSocket monitors as backup.
+        # DO NOT close trades on candle close — this interferes with exchange atomicity.
         if self._current_trade and not self._current_trade.closed:
             self.risk.update_trailing_stops(self.symbol, latest_price)
-            if self.risk.should_exit_by_stop(self.symbol, latest_price):
-                await self._execute_close(self._current_trade, latest_price, reason="trailing_stop")
-                return
-            if self.risk.should_exit_by_tp(self.symbol, latest_price):
-                await self._execute_close(self._current_trade, latest_price, reason="take_profit_candle")
-                return
 
         # Generate signal (with optional multi-timeframe)
         htf_df = await self._fetch_htf_df(end)
