@@ -282,7 +282,19 @@ class ExecutionEngine:
             if not trade or trade.closed:
                 return
 
-            # Use effective stop (max of hard SL and trailing SL for long)
+            # ── Step 1: Update peak price tracking ──────────────────────────
+            # Must happen BEFORE trailing stop update so peak is current
+            if trade.peak_price is not None:
+                if trade.side == "long":
+                    trade.peak_price = max(trade.peak_price, latest_price)
+                else:
+                    trade.peak_price = min(trade.peak_price, latest_price)
+
+            # ── Step 2: Update trailing/breakeven/profit-lock stops ──────────
+            # Must happen BEFORE the SL check below so effective_sl is current
+            self.risk.update_trailing_stops(self.symbol, latest_price)
+
+            # ── Step 3: Check SL/TP with up-to-date stops ───────────────────
             if trade.side == "long":
                 trail = trade.trailing_stop_price or 0
                 effective_sl = max(trail, trade.stop_loss)
@@ -302,15 +314,6 @@ class ExecutionEngine:
                 if trade.take_profit and latest_price <= trade.take_profit:
                     await self._ws_close(trade, latest_price, "take_profit_ws")
                     return
-
-            # Update trailing stops on every tick
-            self.risk.update_trailing_stops(self.symbol, latest_price)
-
-            if trade.peak_price is not None:
-                if trade.side == "long":
-                    trade.peak_price = max(trade.peak_price, latest_price)
-                else:
-                    trade.peak_price = min(trade.peak_price, latest_price)
 
         except Exception as exc:
             logger.warning("WS tick handler error: %s", exc)
@@ -511,13 +514,22 @@ class ExecutionEngine:
             await self.rest.place_order(order)
             logger.info("Close order placed: %s %s @ %.4f (%s)", trade.symbol, trade.side, price, reason)
         except Exception as exc:
-            logger.error("Close order failed: %s — position may still be open!", exc)
-            try:
-                send(f"🚨 CLOSE FAILED: {trade.symbol} — {str(exc)[:200]}")
-            except Exception:
-                pass
-            # Don't update capital if close failed
-            return
+            exc_str = str(exc)
+            # Exchange bracket SL/TP already closed the position — this is expected.
+            # Treat it as a successful close so capital/stats still get updated.
+            if "no_position_for_reduce_only" in exc_str:
+                logger.info(
+                    "Close skipped — exchange bracket already closed %s %s (reason=%s)",
+                    trade.symbol, trade.side, reason,
+                )
+            else:
+                logger.error("Close order failed: %s — position may still be open!", exc)
+                try:
+                    send(f"🚨 CLOSE FAILED: {trade.symbol} — {exc_str[:200]}")
+                except Exception:
+                    pass
+                # Only abort capital update for genuine failures, not already-closed positions
+                return
 
         # Cancel remaining bracket SL/TP orders
         try:

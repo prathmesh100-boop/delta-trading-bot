@@ -82,10 +82,10 @@ async def cmd_trade(args):
         daily_loss_limit_pct=0.10,
         leverage=float(args.leverage),
         max_position_size_pct=0.30,
-        breakeven_trigger_pct=float(getattr(args, "breakeven_trigger_pct", 0.005)),
-        breakeven_buffer=float(getattr(args, "breakeven_buffer", 0.0)),
-        profit_lock_threshold_pct=float(getattr(args, "profit_lock_threshold_pct", 0.01)),
-        profit_lock_pct=float(getattr(args, "profit_lock_pct", 0.005)),
+        breakeven_trigger_pct=float(getattr(args, "breakeven_trigger_pct", 0.003)),
+        breakeven_buffer=float(getattr(args, "breakeven_buffer", 0.0002)),
+        profit_lock_threshold_pct=float(getattr(args, "profit_lock_threshold_pct", 0.005)),
+        profit_lock_pct=float(getattr(args, "profit_lock_pct", 0.003)),
     )
     risk_mgr = RiskManager(risk_cfg, initial_capital=args.capital)
 
@@ -184,10 +184,10 @@ def build_parser():
     pt.add_argument("--capital", type=float, default=100.0)
     pt.add_argument("--leverage", type=int, default=10)
     pt.add_argument("--resolution", type=int, default=15)
-    pt.add_argument("--breakeven-trigger-pct", type=float, default=0.005)
+    pt.add_argument("--breakeven-trigger-pct", type=float, default=0.003)
     pt.add_argument("--breakeven-buffer", type=float, default=0.0)
-    pt.add_argument("--profit-lock-threshold-pct", type=float, default=0.01)
-    pt.add_argument("--profit-lock-pct", type=float, default=0.005)
+    pt.add_argument("--profit-lock-threshold-pct", type=float, default=0.005)
+    pt.add_argument("--profit-lock-pct", type=float, default=0.003)
 
     pb = sub.add_parser("backtest")
     pb.add_argument("--strategy", default="ema_crossover", choices=["ema_crossover", "bollinger_mean_reversion", "smart_money"])

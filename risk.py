@@ -49,13 +49,20 @@ class RiskConfig:
     weekly_loss_limit_pct: float = 0.20
 
     # Trailing stop parameters (software layer — only tightens, never loosens)
-    trailing_stop_pct: float = 0.02       # 2% from peak
+    # Was 2.0% — far too wide. At 2%, a +0.3% move still had the trailing SL
+    # 1.65 USDT below entry, wiping all profit on any reversal.
+    trailing_stop_pct: float = 0.008      # 0.8% from peak (was 2.0%)
 
     # Breakeven / profit lock
-    breakeven_trigger_pct: float = 0.005  # Move SL to entry when profit ≥ 0.5%
+    # Was 0.5% trigger — SOL/BTC 15m candles rarely travel that far before
+    # reversing, so breakeven almost never fired. Now 0.3% so any decent move
+    # immediately locks in a no-loss exit.
+    breakeven_trigger_pct: float = 0.003  # Move SL to entry at +0.3% profit (was 0.5%)
     breakeven_buffer: float = 0.0         # Buffer above entry for breakeven
-    profit_lock_threshold_pct: float = 0.01   # Enable profit lock at 1% profit
-    profit_lock_pct: float = 0.005        # Lock at peak * (1 - 0.5%)
+    # Was 1.0% — virtually never reached on small moves. Now 0.5% so profit
+    # lock engages shortly after breakeven activates.
+    profit_lock_threshold_pct: float = 0.005  # Enable profit lock at +0.5% profit (was 1.0%)
+    profit_lock_pct: float = 0.003        # Lock at peak * (1 - 0.3%) (was 0.5%)
 
     # Fees
     maker_fee: float = 0.0002
