@@ -291,6 +291,7 @@ class Backtester:
 
         logger.info("Best params: %s → %s=%.4f", best_params, metric, best_score)
         return best_params, best_result
+        return best_params, best_result
 
 
 # ─────────────────────────────────────────────

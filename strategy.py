@@ -36,6 +36,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from regime import RegimeDetector
 
 logger = logging.getLogger(__name__)
 
@@ -555,7 +556,7 @@ class SmartMoneyStrategy(BaseStrategy):
                 self._last_signal_type = SignalType.LONG
                 logger.info("📈 LONG signal: %s | rsi=%.1f adx=%.1f vol=%.2fx confluence=%d/3",
                             symbol, rsi_now, adx_now, vol_r, confluence)
-                return Signal(
+                sig = Signal(
                     type=SignalType.LONG, symbol=symbol, price=price,
                     stop_loss=sl, take_profit=tp2,
                     confidence=conf,
@@ -567,6 +568,30 @@ class SmartMoneyStrategy(BaseStrategy):
                         "confluence": confluence, "htf_bias": "long",
                     },
                 )
+
+                # Regime-based confidence adjustment (causal)
+                try:
+                    regime = RegimeDetector().detect_regime(df)
+                except Exception:
+                    regime = None
+                sig.metadata["regime"] = regime
+                orig_conf = float(sig.confidence)
+                if regime == "trend":
+                    multiplier = 1.2
+                elif regime == "range":
+                    multiplier = 0.6
+                elif regime == "volatile":
+                    multiplier = 0.4
+                else:
+                    multiplier = 1.0
+                sig.confidence = max(0.1, min(1.0, orig_conf * multiplier))
+                logger.debug("SmartMoney: regime=%s orig_conf=%.2f adj_conf=%.2f", regime, orig_conf, sig.confidence)
+
+                # Safety rule: block low-confidence trades in volatile regimes
+                if regime == "volatile" and sig.confidence < 0.6:
+                    return hold(symbol, price)
+
+                return sig
 
         # ── SHORT signal ──────────────────────────────────────────────────
         ltf_cross_short = f_prev >= s_prev and f_now < s_now
@@ -591,7 +616,7 @@ class SmartMoneyStrategy(BaseStrategy):
                 self._last_signal_type = SignalType.SHORT
                 logger.info("📉 SHORT signal: %s | rsi=%.1f adx=%.1f vol=%.2fx confluence=%d/3",
                             symbol, rsi_now, adx_now, vol_r, confluence)
-                return Signal(
+                sig = Signal(
                     type=SignalType.SHORT, symbol=symbol, price=price,
                     stop_loss=sl, take_profit=tp2,
                     confidence=conf,
@@ -603,6 +628,30 @@ class SmartMoneyStrategy(BaseStrategy):
                         "confluence": confluence, "htf_bias": "short",
                     },
                 )
+
+                # Regime-based confidence adjustment (causal)
+                try:
+                    regime = RegimeDetector().detect_regime(df)
+                except Exception:
+                    regime = None
+                sig.metadata["regime"] = regime
+                orig_conf = float(sig.confidence)
+                if regime == "trend":
+                    multiplier = 1.2
+                elif regime == "range":
+                    multiplier = 0.6
+                elif regime == "volatile":
+                    multiplier = 0.4
+                else:
+                    multiplier = 1.0
+                sig.confidence = max(0.1, min(1.0, orig_conf * multiplier))
+                logger.debug("SmartMoney: regime=%s orig_conf=%.2f adj_conf=%.2f", regime, orig_conf, sig.confidence)
+
+                # Safety rule: block low-confidence trades in volatile regimes
+                if regime == "volatile" and sig.confidence < 0.6:
+                    return hold(symbol, price)
+
+                return sig
 
         return hold(symbol, price)
 

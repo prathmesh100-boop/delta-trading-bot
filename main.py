@@ -192,6 +192,8 @@ def build_parser():
     pb = sub.add_parser("backtest")
     pb.add_argument("--strategy", default="ema_crossover", choices=["ema_crossover", "bollinger_mean_reversion", "smart_money"])
     pb.add_argument("--symbol", default="BTCUSD")
+    pb.add_argument("--symbols", default=None,
+                    help="Optional comma-separated list of symbols to run multi-symbol allocation demo (overrides --symbol)")
     pb.add_argument("--capital", type=float, default=10_000.0)
     pb.add_argument("--data-file", default=None)
 
