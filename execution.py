@@ -95,8 +95,8 @@ class TradeLogger:
         self.filepath = filepath
         self._cols = [
             "symbol", "side", "entry_time", "exit_time",
-            "entry_price", "exit_price", "size_lots", "remaining_lots",
-            "contract_value", "partial_pnl", "final_pnl", "total_pnl",
+            "entry_price", "exit_price", "size_lots",
+            "contract_value", "total_pnl",
             "exit_reason", "order_id",
         ]
         try:
@@ -114,10 +114,7 @@ class TradeLogger:
             "entry_price": trade.entry_price,
             "exit_price": trade.exit_price,
             "size_lots": trade.size,
-            "remaining_lots": trade.remaining_size,
             "contract_value": trade.contract_value,
-            "partial_pnl": round(trade.partial_pnl, 6),
-            "final_pnl": round(trade.realised_pnl - trade.partial_pnl, 6),
             "total_pnl": round(trade.realised_pnl, 6),
             "exit_reason": trade.exit_reason or "",
             "order_id": trade.order_id or "",
@@ -173,7 +170,6 @@ class ExecutionEngine:
         self._current_trade: Optional[TradeRecord] = None
         self._running = False
         self._close_lock = asyncio.Lock()
-        self._partial_lock = asyncio.Lock()
         self._last_signal_type: Optional[SignalType] = None
         self._last_signal_time: Optional[datetime] = None
 
@@ -308,14 +304,22 @@ class ExecutionEngine:
             # ── Update trailing/breakeven/profit-lock stops ─────────────
             self.risk.update_trailing_stops(self.symbol, latest_price)
 
-            # ── TP1: Partial close check (50% of position) ──────────────
-            if not trade.partial_closed:
-                partial_trade = self.risk.should_partial_close(self.symbol, latest_price)
-                if partial_trade and not trade.closed:
-                    await self._ws_partial_close(trade, latest_price)
-                    return   # Don't check SL/TP2 on same tick
+            # NOTE: TP1 partial close disabled for hybrid scalping/swing mode —
+            # partial close logic removed to avoid leaving a "hope" position.
 
             # ── SL + TP2: Full close check ──────────────────────────────
+            # HARD PROFIT-LOCK: move SL to entry when small profit achieved
+            try:
+                # Protect small quick gains by moving SL to entry (causal)
+                if trade.side == "long":
+                    if latest_price >= trade.entry_price * 1.002:
+                        trade.stop_loss = max(trade.stop_loss, trade.entry_price)
+                else:
+                    if latest_price <= trade.entry_price * 0.998:
+                        trade.stop_loss = min(trade.stop_loss, trade.entry_price)
+            except Exception:
+                pass
+
             if trade.side == "long":
                 trail = trade.trailing_stop_price or 0
                 effective_sl = max(trail, trade.stop_loss)
@@ -339,52 +343,7 @@ class ExecutionEngine:
         except Exception as exc:
             logger.warning("WS tick handler error: %s", exc)
 
-    async def _ws_partial_close(self, trade: TradeRecord, price: float):
-        """50% partial close at TP1. Non-blocking with lock."""
-        async with self._partial_lock:
-            if trade.closed or trade.partial_closed:
-                return
-
-            partial_lots = trade.partial_size
-            if partial_lots < 1:
-                return
-
-            close_side = OrderSide.SELL if trade.side == "long" else OrderSide.BUY
-            order = Order(
-                product_id=self.product_id,
-                side=close_side,
-                order_type=OrderType.MARKET,
-                size=partial_lots,
-                reduce_only=True,
-            )
-            try:
-                await self.rest.place_order(order)
-            except Exception as exc:
-                exc_str = str(exc)
-                if "no_position_for_reduce_only" in exc_str:
-                    logger.info("Partial close skipped — exchange already closed position")
-                    return
-                logger.error("Partial close order failed: %s", exc)
-                return
-
-            # Record partial close in risk manager
-            self.risk.record_partial_close(trade, price, partial_lots)
-
-            logger.info(
-                "⚡ PARTIAL CLOSE (TP1): %s %s | closed=%d lots @ %.4f | pnl=%.4f | remaining=%d lots",
-                trade.symbol, trade.side, partial_lots, price, trade.partial_pnl, trade.remaining_size,
-            )
-            try:
-                send(
-                    f"⚡ PARTIAL CLOSE (50% at TP1)\n"
-                    f"{trade.side.upper()} {self.symbol}\n"
-                    f"Closed: {partial_lots} lots @ {price:.4f}\n"
-                    f"PnL: {trade.partial_pnl:+.4f} USDT\n"
-                    f"Remaining: {trade.remaining_size} lots\n"
-                    f"New SL: {trade.trailing_stop_price:.4f}"
-                )
-            except Exception:
-                pass
+    # Partial close removed: feature intentionally deleted to avoid leaving a hope position
 
     async def _ws_close(self, trade: TradeRecord, price: float, reason: str):
         """Full close from WebSocket handler with lock to prevent double-close."""
@@ -552,7 +511,6 @@ class ExecutionEngine:
             size=size_lots,
             stop_loss=signal.stop_loss or 0.0,
             take_profit=signal.take_profit or 0.0,
-            tp1=signal.tp1,                           # TP1 for partial close
             entry_time=datetime.utcnow(),
             order_id=str(result.get("id", client_id)),
             peak_price=price,
@@ -562,10 +520,9 @@ class ExecutionEngine:
         self.risk.register_trade(trade)
 
         logger.info(
-            "🔲 BRACKET ENTRY: %s %s | lots=%d | entry=%.4f | sl=%.4f | tp1=%s | tp2=%.4f",
+            "🔲 BRACKET ENTRY: %s %s | lots=%d | entry=%.4f | sl=%.4f | tp2=%.4f",
             trade.side.upper(), self.symbol, size_lots, price,
             signal.stop_loss or 0,
-            f"{signal.tp1:.4f}" if signal.tp1 else "N/A",
             signal.take_profit or 0,
         )
 
@@ -582,8 +539,8 @@ class ExecutionEngine:
                 return
             trade.closed = True
 
-        # Close remaining lots (not partial_size, remaining_size)
-        active_size = trade.remaining_size if trade.partial_closed else trade.size
+        # Close full open size
+        active_size = trade.size
         if active_size < 1:
             active_size = 1
 
@@ -628,13 +585,11 @@ class ExecutionEngine:
         self._htf_cache_time = 0.0
 
         pnl_emoji = "✅" if trade.realised_pnl >= 0 else "❌"
-        partial_note = f"\nPartial at TP1: +{trade.partial_pnl:.4f} USDT" if trade.partial_closed else ""
         try:
             send(
                 f"{pnl_emoji} CLOSE ({reason})\n"
                 f"{trade.side.upper()} {self.symbol}\n"
                 f"Entry: {trade.entry_price:.4f} → Exit: {price:.4f}\n"
-                f"{partial_note}\n"
                 f"Total PnL: {trade.realised_pnl:+.4f} USDT"
             )
         except Exception:

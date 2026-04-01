@@ -28,16 +28,3 @@ def test_check_signal_halts_and_limits():
     # With large drawdown/daily loss, trading should be halted or limited
     assert allowed is False
 
-
-def test_partial_close_and_recording():
-    cfg = RiskConfig()
-    rm = RiskManager(cfg, initial_capital=5000.0)
-    tr = TradeRecord(symbol="SYM", side="long", entry_price=100.0, size=10, stop_loss=95.0, take_profit=110.0, entry_time=datetime.utcnow())
-    tr.tp1 = 105.0
-    rm.register_trade(tr)
-    # simulate TP1 hit
-    trade = rm.should_partial_close("SYM", current_price=106.0)
-    assert trade is not None
-    rm.record_partial_close(trade, exit_price=106.0, partial_lots=trade.partial_size)
-    assert trade.partial_closed is True
-    assert rm.current_capital > 0

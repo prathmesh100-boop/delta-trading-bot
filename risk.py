@@ -62,14 +62,14 @@ class RiskConfig:
     weekly_loss_limit_pct: float = 0.20
 
     # Trailing stop (software layer — only tightens, never loosens)
-    trailing_stop_pct: float = 0.008      # 0.8% from peak (normal)
-    trailing_stop_pct_after_partial: float = 0.004  # 0.4% after TP1 (tightens after partial)
+    trailing_stop_pct: float = 0.003      # 0.3% from peak (aggressive)
+    trailing_stop_pct_after_partial: float = 0.003  # tightened after partial (kept aligned)
 
     # Breakeven / profit lock
-    breakeven_trigger_pct: float = 0.003  # Move SL to entry at +0.3% profit
+    breakeven_trigger_pct: float = 0.002  # Move SL to entry at +0.2% profit
     breakeven_buffer: float = 0.0
-    profit_lock_threshold_pct: float = 0.005  # Enable profit lock at +0.5%
-    profit_lock_pct: float = 0.003        # Lock at peak * (1 - 0.3%)
+    profit_lock_threshold_pct: float = 0.003  # Enable profit lock at +0.3%
+    profit_lock_pct: float = 0.002        # Lock at peak * (1 - 0.2%)
 
     # Confidence-based sizing multipliers
     confidence_high_threshold: float = 0.85
@@ -106,28 +106,16 @@ class TradeRecord:
     exit_price: Optional[float] = None
     exit_time: Optional[datetime] = None
     exit_reason: Optional[str] = None
-
-    # Partial profit tracking
-    tp1: Optional[float] = None           # First TP level (50% close price)
-    partial_closed: bool = False          # True once 50% has been closed
-    partial_size: int = 0                 # Lots closed at TP1
-    remaining_size: int = 0              # Lots remaining after partial
-    partial_pnl: float = 0.0             # PnL locked by partial close
-
     def __post_init__(self):
-        if self.remaining_size == 0:
-            self.remaining_size = self.size
-        # partial_size = floor(size/2), minimum 1 lot if size > 1
-        if self.size > 1:
-            self.partial_size = max(1, self.size // 2)
-        else:
-            self.partial_size = 0        # Can't partial-close a 1-lot position
+        # Ensure sensible defaults
+        if getattr(self, "size", None) is None:
+            self.size = 0
 
     def unrealized_pnl(self, current_price: float) -> float:
         """Estimate unrealized PnL in quote currency (USDT)."""
         if self.contract_value <= 0:
             return 0.0
-        active_size = self.remaining_size if self.partial_closed else self.size
+        active_size = self.size
         if self.side == "long":
             return (current_price - self.entry_price) * active_size * self.contract_value
         else:
@@ -163,7 +151,7 @@ class RiskManager:
         self.winning_trades: int = 0
         self.losing_trades: int = 0
         self.total_gross_pnl: float = 0.0
-        self.partial_closes: int = 0
+        # partial close bookkeeping removed
 
     def _refresh_daily(self):
         today = date.today()
@@ -265,71 +253,12 @@ class RiskManager:
         key = trade.order_id or f"{trade.symbol}_{trade.entry_time.timestamp()}"
         self._open_trades[key] = trade
         logger.info(
-            "Trade registered: %s %s | lots=%d entry=%.4f sl=%.4f tp1=%s tp2=%.4f cv=%s",
+            "Trade registered: %s %s | lots=%d entry=%.4f sl=%.4f tp2=%.4f cv=%s",
             trade.side, trade.symbol, trade.size, trade.entry_price,
             trade.stop_loss,
-            f"{trade.tp1:.4f}" if trade.tp1 else "N/A",
             trade.take_profit, trade.contract_value,
         )
 
-    def should_partial_close(self, symbol: str, current_price: float) -> Optional[TradeRecord]:
-        """
-        Returns a trade if it should do a 50% partial close (TP1 hit).
-        Only returns if:
-          - TP1 is set
-          - not already partially closed
-          - position size > 1 lot (can't partial-close 1 lot)
-        """
-        for trade in self._open_trades.values():
-            if trade.symbol != symbol or trade.closed or trade.partial_closed:
-                continue
-            if trade.tp1 is None or trade.partial_size < 1:
-                continue
-            if trade.side == "long" and current_price >= trade.tp1:
-                return trade
-            if trade.side == "short" and current_price <= trade.tp1:
-                return trade
-        return None
-
-    def record_partial_close(self, trade: TradeRecord, exit_price: float, partial_lots: int):
-        """
-        Record a partial close (TP1 hit). Updates capital and trade record.
-        Does NOT remove trade from open trades — it stays open for remaining lots.
-        """
-        cv = trade.contract_value if trade.contract_value > 0 else 0.001
-        price_diff = (
-            (exit_price - trade.entry_price) if trade.side == "long"
-            else (trade.entry_price - exit_price)
-        )
-        gross_pnl = price_diff * partial_lots * cv
-        fee_est = (trade.entry_price + exit_price) * partial_lots * cv * self.cfg.taker_fee
-        net_pnl = gross_pnl - fee_est
-
-        trade.partial_closed = True
-        trade.partial_pnl = net_pnl
-        trade.remaining_size = trade.size - partial_lots
-        trade.realised_pnl += net_pnl
-
-        # Tighten trailing stop after partial close
-        if trade.side == "long":
-            tight_trail = exit_price * (1 - self.cfg.trailing_stop_pct_after_partial)
-            if trade.trailing_stop_price is None or tight_trail > trade.trailing_stop_price:
-                trade.trailing_stop_price = tight_trail
-                logger.info("Trailing stop tightened after partial: %s long → sl=%.4f",
-                            symbol if (symbol := trade.symbol) else trade.symbol, tight_trail)
-        elif trade.side == "short":
-            tight_trail = exit_price * (1 + self.cfg.trailing_stop_pct_after_partial)
-            if trade.trailing_stop_price is None or tight_trail < trade.trailing_stop_price:
-                trade.trailing_stop_price = tight_trail
-
-        self.current_capital += net_pnl
-        self.peak_capital = max(self.peak_capital, self.current_capital)
-        self.partial_closes += 1
-
-        logger.info(
-            "⚡ PARTIAL CLOSE (TP1): %s %s | lots=%d @ %.4f | pnl=%.4f USDT | remaining=%d lots",
-            trade.symbol, trade.side, partial_lots, exit_price, net_pnl, trade.remaining_size,
-        )
 
     def update_trailing_stops(self, symbol: str, current_price: float) -> Optional[float]:
         """
@@ -340,12 +269,8 @@ class RiskManager:
             if trade.symbol != symbol or trade.closed:
                 continue
 
-            # Use tighter trailing after partial close
-            trail_pct = (
-                self.cfg.trailing_stop_pct_after_partial
-                if trade.partial_closed
-                else self.cfg.trailing_stop_pct
-            )
+            # Use configured trailing percentage (partial-close flow removed)
+            trail_pct = self.cfg.trailing_stop_pct
 
             if trade.side == "long":
                 if trade.peak_price is None:
@@ -437,7 +362,7 @@ class RiskManager:
         Uses remaining_size (accounts for already partially-closed lots).
         """
         cv = trade.contract_value if trade.contract_value > 0 else 0.001
-        active_size = trade.remaining_size if trade.partial_closed else trade.size
+        active_size = trade.size
         price_diff = (
             (exit_price - trade.entry_price) if trade.side == "long"
             else (trade.entry_price - exit_price)
@@ -468,12 +393,10 @@ class RiskManager:
         self._open_trades.pop(ts_key, None)
 
         logger.info(
-            "Trade closed (%s): %s %s | entry=%.4f exit=%.4f | final_pnl=%.4f total_pnl=%.4f USDT | "
-            "partial=%s | capital=%.2f | dd=%.2f%%",
+            "Trade closed (%s): %s %s | entry=%.4f exit=%.4f | final_pnl=%.4f total_pnl=%.4f USDT | capital=%.2f | dd=%.2f%%",
             reason, trade.symbol, trade.side,
             trade.entry_price, exit_price,
             net_pnl, trade.realised_pnl,
-            f"{trade.partial_pnl:.4f}" if trade.partial_closed else "N/A",
             self.current_capital,
             self.current_drawdown * 100,
         )
@@ -515,7 +438,6 @@ class RiskManager:
             "total_trades": self.total_trades,
             "win_rate": round(self.win_rate * 100, 1),
             "total_pnl": round(self.total_gross_pnl, 4),
-            "partial_closes": self.partial_closes,
             "halted": self.trading_halted,
             "daily_limit_hit": self.daily_limit_hit,
         }

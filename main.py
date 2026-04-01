@@ -184,10 +184,10 @@ def build_parser():
     pt.add_argument("--capital", type=float, default=100.0)
     pt.add_argument("--leverage", type=int, default=10)
     pt.add_argument("--resolution", type=int, default=15)
-    pt.add_argument("--breakeven-trigger-pct", type=float, default=0.003)
+    pt.add_argument("--breakeven-trigger-pct", type=float, default=0.002)
     pt.add_argument("--breakeven-buffer", type=float, default=0.0)
-    pt.add_argument("--profit-lock-threshold-pct", type=float, default=0.005)
-    pt.add_argument("--profit-lock-pct", type=float, default=0.003)
+    pt.add_argument("--profit-lock-threshold-pct", type=float, default=0.003)
+    pt.add_argument("--profit-lock-pct", type=float, default=0.002)
 
     pb = sub.add_parser("backtest")
     pb.add_argument("--strategy", default="ema_crossover", choices=["ema_crossover", "bollinger_mean_reversion", "smart_money"])
