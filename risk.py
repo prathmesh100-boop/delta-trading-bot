@@ -1,443 +1,456 @@
 """
-risk.py — Risk management v4 (UPGRADED)
+risk.py — Risk Manager v5 (PRODUCTION)
 
-KEY IMPROVEMENTS vs v3:
-  1. Partial profit booking (50% close at TP1)
-     - TradeRecord.partial_closed flag prevents double-partial
-     - partial_size = floor(size / 2), minimum 1 lot
-     - RiskManager.should_partial_close() called by execution engine
-
-  2. Tighter trailing stop after partial close
-     - After TP1 hit: trailing_stop_pct tightens to 0.4% (was 0.8%)
-     - Prevents giving back partial gains on reversal
-
-  3. Faster position sizing
-     - calculate_position_size() uses confidence weighting
-     - High-confidence signals (≥0.85) get 1.2× size
-     - Low-confidence signals (<0.65) get 0.75× size
-
-  4. Improved daily reset
-     - Reliable timezone-safe date comparison
-     - Weekly PnL tracked separately
-
-  5. Added status_dict() snapshot for dashboard
+Features:
+  - RiskConfig: all risk parameters in one dataclass
+  - RiskManager: per-trade position sizing, daily loss limit, drawdown halt
+  - TradeRecord: full lifecycle tracking (entry → partial → close)
+  - Trailing stop: breakeven + profit-lock + ATR trailing
+  - Thread-safe with asyncio.Lock on critical sections
+  - Daily reset: resets daily_pnl at UTC midnight
 """
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date, datetime
-from typing import Dict, Optional
-
-from strategy import Signal, SignalType
+from datetime import datetime, date
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────
-# Configuration
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class RiskConfig:
-    # Position sizing
-    risk_per_trade: float = 0.02          # 2% of capital per trade
-    max_position_size_pct: float = 0.20   # max 20% of capital (with leverage)
-    leverage: float = 1.0                 # default leverage (overridden per symbol)
-    leverage_by_symbol: Dict[str, float] = field(default_factory=lambda: {
-        "BTC_USDT": 10.0,
-        "BTCUSD": 10.0,
-        "ETH_USDT": 10.0,
-        "ETHUSD": 10.0,
-        "SOL_USDT": 10.0,
-        "SOLUSD": 10.0,
-    })
+    # Per-trade risk as fraction of capital (e.g. 0.01 = 1%)
+    risk_per_trade:       float = 0.01
 
-    # Portfolio limits
-    max_open_trades: int = 2
-    max_correlated_exposure: float = 0.10
+    # Max portfolio drawdown before bot halts (e.g. 0.15 = 15%)
+    max_drawdown_pct:     float = 0.15
 
-    # Drawdown / loss limits
-    max_drawdown_pct: float = 0.15        # 15% drawdown → halt trading
-    daily_loss_limit_pct: float = 0.10    # 10% daily loss → pause
-    weekly_loss_limit_pct: float = 0.20
+    # Daily loss limit as fraction of starting capital (e.g. 0.05 = 5%)
+    daily_loss_limit_pct: float = 0.05
 
-    # Trailing stop (software layer — only tightens, never loosens)
-    trailing_stop_pct: float = 0.003      # 0.3% from peak (aggressive)
-    trailing_stop_pct_after_partial: float = 0.003  # tightened after partial (kept aligned)
+    # Maximum concurrent open trades
+    max_open_trades:      int   = 3
 
-    # Breakeven / profit lock
-    breakeven_trigger_pct: float = 0.002  # Move SL to entry at +0.2% profit
-    breakeven_buffer: float = 0.0
-    profit_lock_threshold_pct: float = 0.003  # Enable profit lock at +0.3%
-    profit_lock_pct: float = 0.002        # Lock at peak * (1 - 0.2%)
+    # Max single position as fraction of capital (e.g. 0.30 = 30%)
+    max_position_size_pct: float = 0.30
 
-    # Confidence-based sizing multipliers
-    confidence_high_threshold: float = 0.85
-    confidence_high_multiplier: float = 1.20
-    confidence_low_threshold: float = 0.65
-    confidence_low_multiplier: float = 0.75
+    # Leverage applied to every position
+    leverage:             float = 10.0
 
-    # Fees
-    maker_fee: float = 0.0002
-    taker_fee: float = 0.0005
-    slippage_pct: float = 0.0003
+    # ── Trailing / Breakeven ──────────────────────────────────────────────
+    # Move SL to entry when price moves this % in our favour
+    breakeven_trigger_pct: float = 0.002   # 0.2%
+    # Buffer above entry when moving SL to breakeven
+    breakeven_buffer:      float = 0.0001  # tiny buffer
+
+    # Activate profit-lock trailing when profit ≥ this %
+    profit_lock_threshold_pct: float = 0.004  # 0.4%
+    # Trail at this distance from peak
+    profit_lock_pct:           float = 0.002  # 0.2%
+
+    # ── Confidence scaling ────────────────────────────────────────────────
+    # Scale position size by signal confidence: True = yes
+    use_confidence_scaling: bool = True
+    # Min/max multiplier applied to base size
+    confidence_min_mult:    float = 0.5
+    confidence_max_mult:    float = 1.0
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Trade Record
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class TradeRecord:
-    symbol: str
-    side: str                             # "long" | "short"
-    entry_price: float
-    size: int                             # integer lots (full position)
-    stop_loss: float
-    take_profit: float
-    entry_time: datetime
-    contract_value: float = 0.001         # base-asset per lot
+    symbol:         str
+    side:           str     # "long" | "short"
+    entry_price:    float
+    size:           int     # lots
+    stop_loss:      float
+    take_profit:    float
+    entry_time:     datetime
+    order_id:       str     = ""
+    peak_price:     Optional[float] = None
+
+    # Optional product metadata
+    contract_value: float   = 0.001
+    min_size:       int     = 1
+
+    # Lifecycle
+    exit_price:     Optional[float]    = None
+    exit_time:      Optional[datetime] = None
+    exit_reason:    Optional[str]      = None
+    closed:         bool               = False
+    partial_closed: bool               = False     # True after TP1 partial fill
+
+    # PnL tracking
+    realised_pnl:   float = 0.0
+    partial_pnl:    float = 0.0
+
+    # Dynamic stop tracking
     trailing_stop_price: Optional[float] = None
-    peak_price: Optional[float] = None
-    breakeven_activated: bool = False
-    order_id: Optional[str] = None
-    realised_pnl: float = 0.0
-    closed: bool = False
-    exit_price: Optional[float] = None
-    exit_time: Optional[datetime] = None
-    exit_reason: Optional[str] = None
-    def __post_init__(self):
-        # Ensure sensible defaults
-        if getattr(self, "size", None) is None:
-            self.size = 0
+    breakeven_moved:     bool            = False
 
-    def unrealized_pnl(self, current_price: float) -> float:
-        """Estimate unrealized PnL in quote currency (USDT)."""
-        if self.contract_value <= 0:
-            return 0.0
-        active_size = self.size
-        if self.side == "long":
-            return (current_price - self.entry_price) * active_size * self.contract_value
-        else:
-            return (self.entry_price - current_price) * active_size * self.contract_value
+    # Bracket order IDs (set after exchange confirmation)
+    sl_order_id: Optional[str] = None
+    tp_order_id: Optional[str] = None
+
+    @property
+    def is_long(self) -> bool:
+        return self.side == "long"
+
+    @property
+    def is_short(self) -> bool:
+        return self.side == "short"
+
+    def pnl_at_price(self, price: float) -> float:
+        """Unrealised PnL in USDT (linear contract)."""
+        direction = 1 if self.is_long else -1
+        return direction * (price - self.entry_price) * self.size * self.contract_value
+
+    def pnl_pct(self, price: float) -> float:
+        """PnL as % of entry price."""
+        direction = 1 if self.is_long else -1
+        return direction * (price - self.entry_price) / self.entry_price if self.entry_price > 0 else 0.0
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Risk Manager
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 class RiskManager:
     """
-    Central risk management with partial profit booking support.
+    Central risk gatekeeper for the execution engine.
+
+    Responsibilities:
+      1. Signal gating: check_signal() → True/False
+      2. Position sizing: calculate_position_size() → USD notional
+      3. Trade registration and tracking
+      4. Daily PnL tracking with daily loss halt
+      5. Drawdown monitoring with portfolio halt
+      6. Trailing / breakeven stop updates (called every WS tick)
     """
 
     def __init__(self, config: RiskConfig, initial_capital: float):
-        self.cfg = config
+        self.cfg             = config
         self.initial_capital = initial_capital
-        self.current_capital = initial_capital
-        self.peak_capital = initial_capital
+        self.capital         = initial_capital
 
-        self._open_trades: Dict[str, TradeRecord] = {}
+        # Open trades (symbol → TradeRecord)
+        self._open_trades:  Dict[str, TradeRecord] = {}
+        self._closed_trades: List[TradeRecord]     = []
 
-        self._daily_start_capital: float = initial_capital
-        self._daily_date: date = date.today()
-        self._weekly_start_capital: float = initial_capital
+        # Daily tracking
+        self._daily_pnl:     float = 0.0
+        self._daily_reset_on: date  = date.today()
 
-        self.trading_halted: bool = False
-        self.daily_limit_hit: bool = False
+        # Portfolio stats
+        self._peak_capital:   float = initial_capital
+        self._total_pnl:      float = 0.0
+        self._halted:         bool  = False
 
-        # Trade stats
-        self.total_trades: int = 0
-        self.winning_trades: int = 0
-        self.losing_trades: int = 0
-        self.total_gross_pnl: float = 0.0
-        # partial close bookkeeping removed
+    # ── State ──────────────────────────────────────────────────────────────
 
-    def _refresh_daily(self):
+    def _maybe_reset_daily(self):
         today = date.today()
-        if today != self._daily_date:
-            logger.info("New trading day — resetting daily PnL. Previous: %.2f%%",
-                        self.daily_pnl_pct * 100)
-            self._daily_start_capital = self.current_capital
-            self._daily_date = today
-            self.daily_limit_hit = False
+        if today != self._daily_reset_on:
+            logger.info("Daily PnL reset (was %.4f USDT). New day: %s", self._daily_pnl, today)
+            self._daily_pnl     = 0.0
+            self._daily_reset_on = today
 
-    # ── Signal gate ───────────────────────────
+    @property
+    def is_halted(self) -> bool:
+        return self._halted
 
-    def check_signal(self, signal: Signal) -> bool:
-        self._refresh_daily()
+    @property
+    def daily_pnl(self) -> float:
+        self._maybe_reset_daily()
+        return self._daily_pnl
 
-        if self.trading_halted:
-            logger.warning("HALT: Trading halted (max drawdown breach)")
+    @property
+    def drawdown_pct(self) -> float:
+        if self._peak_capital <= 0:
+            return 0.0
+        return (self._peak_capital - self.capital) / self._peak_capital
+
+    @property
+    def open_trade_count(self) -> int:
+        return len(self._open_trades)
+
+    # ── Gating ─────────────────────────────────────────────────────────────
+
+    def check_signal(self, signal) -> bool:
+        """
+        Returns True if the signal is allowed to proceed.
+        Checks: halted, daily limit, drawdown limit, max open trades, capital floor.
+        """
+        self._maybe_reset_daily()
+
+        if self._halted:
+            logger.warning("RISK: Bot is halted — ignoring signal")
             return False
 
-        if self.daily_limit_hit:
-            logger.warning("HALT: Daily loss limit reached for today")
+        # Daily loss limit
+        daily_limit = self.initial_capital * self.cfg.daily_loss_limit_pct
+        if self._daily_pnl <= -daily_limit:
+            logger.warning("RISK: Daily loss limit hit (%.4f). Halting for today.", self._daily_pnl)
+            self._halted = True
             return False
 
-        if signal.type == SignalType.HOLD:
-            return False
-
-        if signal.type in (SignalType.LONG, SignalType.SHORT):
-            if len(self._open_trades) >= self.cfg.max_open_trades:
-                logger.warning("RISK: Max open trades (%d) reached", self.cfg.max_open_trades)
-                return False
-
-        drawdown = (self.peak_capital - self.current_capital) / max(self.peak_capital, 1e-9)
-        if drawdown >= self.cfg.max_drawdown_pct:
-            logger.error(
-                "HALT: Max drawdown %.2f%% ≥ threshold %.2f%%",
-                drawdown * 100, self.cfg.max_drawdown_pct * 100,
+        # Drawdown limit
+        if self.drawdown_pct >= self.cfg.max_drawdown_pct:
+            logger.warning(
+                "RISK: Max drawdown %.1f%% reached (peak=%.2f current=%.2f). HALTING.",
+                self.drawdown_pct * 100, self._peak_capital, self.capital
             )
-            self.trading_halted = True
+            self._halted = True
             return False
 
-        daily_loss = (self._daily_start_capital - self.current_capital) / max(self._daily_start_capital, 1e-9)
-        if daily_loss >= self.cfg.daily_loss_limit_pct:
-            logger.error(
-                "HALT: Daily loss %.2f%% ≥ limit %.2f%%",
-                daily_loss * 100, self.cfg.daily_loss_limit_pct * 100,
-            )
-            self.daily_limit_hit = True
+        # Max open trades
+        if len(self._open_trades) >= self.cfg.max_open_trades:
+            logger.info("RISK: Max open trades (%d) reached", self.cfg.max_open_trades)
+            return False
+
+        # Capital floor: need at least 5 USDT to trade
+        if self.capital < 5.0:
+            logger.warning("RISK: Capital %.2f below floor — halting", self.capital)
+            self._halted = True
             return False
 
         return True
 
-    # ── Position sizing ───────────────────────
+    # ── Position Sizing ────────────────────────────────────────────────────
 
-    def calculate_position_size(self, signal: Signal, current_price: float, symbol: str) -> float:
+    def calculate_position_size(self, signal, price: float, symbol: str) -> float:
         """
-        Returns USD notional to risk.
+        Returns USD notional to trade.
 
         Formula:
-          stop_dist_pct = |price - stop_loss| / price
-          risk_usd      = capital × risk_per_trade × confidence_multiplier
-          notional_usd  = risk_usd / stop_dist_pct × leverage
+            risk_amount = capital × risk_per_trade × confidence_multiplier
+            sl_distance = |price - signal.stop_loss|
+            usd_notional = (risk_amount / sl_distance) × price × contract_value
+
+        Capped at max_position_size_pct × capital.
+        Multiplied by leverage.
         """
-        lev = self.cfg.leverage_by_symbol.get(symbol, self.cfg.leverage)
-        stop_loss = signal.stop_loss or current_price * 0.99
-        stop_dist_pct = abs(current_price - stop_loss) / max(current_price, 1e-9)
-        if stop_dist_pct < 1e-6:
-            stop_dist_pct = 0.005
+        if not signal.stop_loss or signal.stop_loss <= 0:
+            return 0.0
 
-        # Confidence-based multiplier
-        conf = signal.confidence
-        if conf >= self.cfg.confidence_high_threshold:
-            conf_mult = self.cfg.confidence_high_multiplier
-        elif conf < self.cfg.confidence_low_threshold:
-            conf_mult = self.cfg.confidence_low_multiplier
-        else:
-            conf_mult = 1.0
+        sl_distance = abs(price - signal.stop_loss)
+        if sl_distance <= 0:
+            return 0.0
 
-        risk_usd = self.current_capital * self.cfg.risk_per_trade
-        notional_usd = (risk_usd / stop_dist_pct) * lev
+        # Base risk amount
+        risk_amount = self.capital * self.cfg.risk_per_trade
 
-        # Apply confidence multiplier to notional (before cap)
-        notional_usd *= conf_mult
+        # Confidence scaling
+        if self.cfg.use_confidence_scaling:
+            conf_mult = self.cfg.confidence_min_mult + (
+                (self.cfg.confidence_max_mult - self.cfg.confidence_min_mult)
+                * getattr(signal, "confidence", 1.0)
+            )
+            risk_amount *= conf_mult
 
-        # Cap at max position size (applied after multiplier)
-        max_notional = self.current_capital * self.cfg.max_position_size_pct * lev
-        notional_usd = min(notional_usd, max_notional)
+        # USD notional (leveraged)
+        # risk_amount = notional × (sl_distance / price)
+        # → notional = risk_amount × (price / sl_distance)
+        notional = risk_amount * (price / sl_distance) * self.cfg.leverage
+
+        # Cap at max position size
+        max_notional = self.capital * self.cfg.max_position_size_pct * self.cfg.leverage
+        notional = min(notional, max_notional)
 
         logger.debug(
-            "Position size: capital=%.2f risk_pct=%.1f%% conf=%.2f(×%.2f) "
-            "sl_dist=%.3f%% lev=%dx → notional=%.2f USD",
-            self.current_capital, self.cfg.risk_per_trade * 100,
-            conf, conf_mult, stop_dist_pct * 100, lev, notional_usd,
+            "Position sizing: capital=%.2f risk=%.4f sl_dist=%.4f → notional=%.2f USD",
+            self.capital, risk_amount, sl_distance, notional,
         )
-        return max(notional_usd, 0.0)
+        return max(0.0, notional)
 
-    # ── Trade lifecycle ───────────────────────
+    # ── Trade Lifecycle ────────────────────────────────────────────────────
 
     def register_trade(self, trade: TradeRecord):
-        key = trade.order_id or f"{trade.symbol}_{trade.entry_time.timestamp()}"
-        self._open_trades[key] = trade
+        """Register a newly opened trade."""
+        if trade.peak_price is None:
+            trade.peak_price = trade.entry_price
+        self._open_trades[trade.symbol] = trade
         logger.info(
-            "Trade registered: %s %s | lots=%d entry=%.4f sl=%.4f tp2=%.4f cv=%s",
-            trade.side, trade.symbol, trade.size, trade.entry_price,
-            trade.stop_loss,
-            trade.take_profit, trade.contract_value,
+            "RISK: Registered %s %s | lots=%d sl=%.4f tp=%.4f",
+            trade.side.upper(), trade.symbol, trade.size, trade.stop_loss, trade.take_profit,
         )
 
-
-    def update_trailing_stops(self, symbol: str, current_price: float) -> Optional[float]:
+    def record_trade_close(
+        self,
+        trade:      TradeRecord,
+        exit_price: float,
+        exit_time:  datetime,
+        reason:     str = "",
+    ) -> float:
         """
-        Update SOFTWARE trailing stop. Does NOT modify exchange bracket SL.
-        Only tightens stop — never loosens it.
+        Finalise a closed trade. Updates capital, PnL, drawdown tracking.
+        Returns realised PnL in USDT.
         """
-        for trade in self._open_trades.values():
-            if trade.symbol != symbol or trade.closed:
-                continue
+        if trade.closed and trade.realised_pnl != 0.0:
+            # Already fully recorded (e.g. called twice on bracket + ws close)
+            return trade.realised_pnl
 
-            # Use configured trailing percentage (partial-close flow removed)
-            trail_pct = self.cfg.trailing_stop_pct
+        direction = 1 if trade.is_long else -1
+        gross_pnl = direction * (exit_price - trade.entry_price) * trade.size * trade.contract_value
 
-            if trade.side == "long":
-                if trade.peak_price is None:
-                    trade.peak_price = trade.entry_price
-                trade.peak_price = max(trade.peak_price, current_price)
+        # Subtract partial PnL already booked
+        net_pnl = gross_pnl - trade.partial_pnl
 
-                new_trail = trade.peak_price * (1 - trail_pct)
-                if trade.trailing_stop_price is None or new_trail > trade.trailing_stop_price:
-                    trade.trailing_stop_price = new_trail
+        trade.exit_price   = exit_price
+        trade.exit_time    = exit_time
+        trade.exit_reason  = reason
+        trade.realised_pnl = gross_pnl   # total gross
+        trade.closed       = True
 
-                # Breakeven
-                if (not trade.breakeven_activated
-                        and self.cfg.breakeven_trigger_pct > 0
-                        and trade.peak_price >= trade.entry_price * (1 + self.cfg.breakeven_trigger_pct)):
-                    be_price = trade.entry_price + self.cfg.breakeven_buffer
-                    if be_price > trade.stop_loss:
-                        trade.stop_loss = be_price
-                        trade.breakeven_activated = True
-                        logger.info("Breakeven activated: %s long → sl=%.4f", symbol, be_price)
+        # Update capital
+        self.capital    += net_pnl
+        self._daily_pnl += net_pnl
+        self._total_pnl += net_pnl
 
-                # Profit lock
-                if (self.cfg.profit_lock_threshold_pct > 0
-                        and trade.peak_price >= trade.entry_price * (1 + self.cfg.profit_lock_threshold_pct)):
-                    lock_price = trade.peak_price * (1 - self.cfg.profit_lock_pct)
-                    if lock_price > trade.stop_loss:
-                        trade.stop_loss = lock_price
-                        logger.debug("Profit lock: %s long → sl=%.4f", symbol, lock_price)
+        if self.capital > self._peak_capital:
+            self._peak_capital = self.capital
 
-                return trade.trailing_stop_price
+        self._open_trades.pop(trade.symbol, None)
+        self._closed_trades.append(trade)
 
-            elif trade.side == "short":
-                if trade.peak_price is None:
-                    trade.peak_price = trade.entry_price
-                trade.peak_price = min(trade.peak_price, current_price)
-
-                new_trail = trade.peak_price * (1 + trail_pct)
-                if trade.trailing_stop_price is None or new_trail < trade.trailing_stop_price:
-                    trade.trailing_stop_price = new_trail
-
-                if (not trade.breakeven_activated
-                        and self.cfg.breakeven_trigger_pct > 0
-                        and trade.peak_price <= trade.entry_price * (1 - self.cfg.breakeven_trigger_pct)):
-                    be_price = trade.entry_price - self.cfg.breakeven_buffer
-                    if be_price < trade.stop_loss:
-                        trade.stop_loss = be_price
-                        trade.breakeven_activated = True
-                        logger.info("Breakeven activated: %s short → sl=%.4f", symbol, be_price)
-
-                if (self.cfg.profit_lock_threshold_pct > 0
-                        and trade.peak_price <= trade.entry_price * (1 - self.cfg.profit_lock_threshold_pct)):
-                    lock_price = trade.peak_price * (1 + self.cfg.profit_lock_pct)
-                    if lock_price < trade.stop_loss:
-                        trade.stop_loss = lock_price
-                        logger.debug("Profit lock: %s short → sl=%.4f", symbol, lock_price)
-
-                return trade.trailing_stop_price
-
-        return None
-
-    def should_exit_by_stop(self, symbol: str, current_price: float) -> Optional[TradeRecord]:
-        for trade in self._open_trades.values():
-            if trade.symbol != symbol or trade.closed:
-                continue
-            trail = trade.trailing_stop_price
-            hard_sl = trade.stop_loss
-            if trade.side == "long":
-                effective_stop = max(trail or 0, hard_sl)
-                if current_price <= effective_stop:
-                    return trade
-            elif trade.side == "short":
-                effective_stop = min(trail if trail else float("inf"), hard_sl)
-                if current_price >= effective_stop:
-                    return trade
-        return None
-
-    def should_exit_by_tp(self, symbol: str, current_price: float) -> Optional[TradeRecord]:
-        for trade in self._open_trades.values():
-            if trade.symbol != symbol or trade.closed:
-                continue
-            if trade.side == "long" and current_price >= trade.take_profit:
-                return trade
-            if trade.side == "short" and current_price <= trade.take_profit:
-                return trade
-        return None
-
-    def record_trade_close(self, trade: TradeRecord, exit_price: float, exit_time: datetime, reason: str = ""):
-        """
-        Update capital on full close.
-        Uses remaining_size (accounts for already partially-closed lots).
-        """
-        cv = trade.contract_value if trade.contract_value > 0 else 0.001
-        active_size = trade.size
-        price_diff = (
-            (exit_price - trade.entry_price) if trade.side == "long"
-            else (trade.entry_price - exit_price)
+        emoji = "✅" if net_pnl >= 0 else "❌"
+        logger.info(
+            "%s Trade closed: %s %s | entry=%.4f exit=%.4f pnl=%.4f USDT | "
+            "capital=%.2f daily_pnl=%.4f drawdown=%.1f%%",
+            emoji, trade.side.upper(), trade.symbol,
+            trade.entry_price, exit_price, net_pnl,
+            self.capital, self._daily_pnl, self.drawdown_pct * 100,
         )
-        gross_pnl = price_diff * active_size * cv
-        fee_est = (trade.entry_price + exit_price) * active_size * cv * self.cfg.taker_fee
-        net_pnl = gross_pnl - fee_est
+        return net_pnl
 
-        # Total realised PnL = partial + final
-        trade.realised_pnl += net_pnl
-        trade.exit_price = exit_price
-        trade.exit_time = exit_time
-        trade.exit_reason = reason
-        trade.closed = True
+    def record_partial_close(self, trade: TradeRecord, close_price: float, close_size: int) -> float:
+        """
+        Record a partial position close (e.g. 50% at TP1).
+        Returns realised PnL for the partial close.
+        """
+        direction  = 1 if trade.is_long else -1
+        partial_pnl = direction * (close_price - trade.entry_price) * close_size * trade.contract_value
 
-        self.current_capital += net_pnl
-        self.peak_capital = max(self.peak_capital, self.current_capital)
-        self.total_gross_pnl += trade.realised_pnl   # total including partial
-        self.total_trades += 1
-        if trade.realised_pnl > 0:
-            self.winning_trades += 1
+        trade.partial_pnl   += partial_pnl
+        trade.partial_closed = True
+        trade.size           = max(0, trade.size - close_size)
+
+        self.capital    += partial_pnl
+        self._daily_pnl += partial_pnl
+        self._total_pnl += partial_pnl
+
+        if self.capital > self._peak_capital:
+            self._peak_capital = self.capital
+
+        logger.info(
+            "Partial close: %s %s +%d lots @ %.4f | partial_pnl=%.4f",
+            trade.side.upper(), trade.symbol, close_size, close_price, partial_pnl,
+        )
+        return partial_pnl
+
+    # ── Trailing Stops (called every WS tick) ──────────────────────────────
+
+    def update_trailing_stops(self, symbol: str, current_price: float):
+        """
+        Update trailing / breakeven stops for the open trade on `symbol`.
+        Called from the WebSocket tick handler (high frequency).
+
+        Order of operations:
+          1. Breakeven: move SL to entry when price moves > breakeven_trigger_pct
+          2. Profit-lock: when profit > profit_lock_threshold_pct, trail at profit_lock_pct
+        """
+        trade = self._open_trades.get(symbol)
+        if not trade or trade.closed:
+            return
+
+        entry = trade.entry_price
+        if entry <= 0:
+            return
+
+        # Update peak
+        if trade.peak_price is None:
+            trade.peak_price = current_price
+        elif trade.is_long:
+            trade.peak_price = max(trade.peak_price, current_price)
         else:
-            self.losing_trades += 1
+            trade.peak_price = min(trade.peak_price, current_price)
 
-        key = trade.order_id or trade.symbol
-        self._open_trades.pop(key, None)
-        ts_key = f"{trade.symbol}_{trade.entry_time.timestamp()}"
-        self._open_trades.pop(ts_key, None)
+        # ── 1. Breakeven ──────────────────────────────────────────────────
+        if not trade.breakeven_moved:
+            trigger_price = entry * (1 + self.cfg.breakeven_trigger_pct) if trade.is_long \
+                       else entry * (1 - self.cfg.breakeven_trigger_pct)
 
-        logger.info(
-            "Trade closed (%s): %s %s | entry=%.4f exit=%.4f | final_pnl=%.4f total_pnl=%.4f USDT | capital=%.2f | dd=%.2f%%",
-            reason, trade.symbol, trade.side,
-            trade.entry_price, exit_price,
-            net_pnl, trade.realised_pnl,
-            self.current_capital,
-            self.current_drawdown * 100,
-        )
+            hit_trigger = (trade.is_long  and current_price >= trigger_price) or \
+                          (trade.is_short and current_price <= trigger_price)
 
-    # ── Stats ─────────────────────────────────
+            if hit_trigger:
+                be_price = entry * (1 + self.cfg.breakeven_buffer) if trade.is_long \
+                      else entry * (1 - self.cfg.breakeven_buffer)
 
-    @property
-    def current_drawdown(self) -> float:
-        return (self.peak_capital - self.current_capital) / max(self.peak_capital, 1e-9)
+                if trade.is_long:
+                    new_sl = max(trade.stop_loss, be_price)
+                else:
+                    new_sl = min(trade.stop_loss, be_price)
 
-    @property
-    def daily_pnl_pct(self) -> float:
-        return (self.current_capital - self._daily_start_capital) / max(self._daily_start_capital, 1e-9)
+                if new_sl != trade.stop_loss:
+                    logger.info("Breakeven SL moved: %s %.4f → %.4f", symbol, trade.stop_loss, new_sl)
+                    trade.stop_loss       = new_sl
+                    trade.breakeven_moved = True
 
-    @property
-    def win_rate(self) -> float:
-        if self.total_trades == 0:
-            return 0.0
-        return self.winning_trades / self.total_trades
+        # ── 2. Profit-lock trailing ───────────────────────────────────────
+        profit_pct = trade.pnl_pct(current_price)
+        if profit_pct >= self.cfg.profit_lock_threshold_pct:
+            if trade.is_long:
+                trail_sl = (trade.peak_price or current_price) * (1 - self.cfg.profit_lock_pct)
+                new_trailing = max(trade.stop_loss, trail_sl)
+            else:
+                trail_sl = (trade.peak_price or current_price) * (1 + self.cfg.profit_lock_pct)
+                new_trailing = min(trade.stop_loss, trail_sl)
 
-    def live_equity(self, price_map: Dict[str, float] = None) -> float:
-        """Capital + estimated unrealized PnL from open trades."""
-        equity = self.current_capital
-        if price_map:
-            for trade in self._open_trades.values():
-                price = price_map.get(trade.symbol)
-                if price:
-                    equity += trade.unrealized_pnl(price)
-        return equity
+            if trade.trailing_stop_price is None or (
+                (trade.is_long  and new_trailing > (trade.trailing_stop_price or 0)) or
+                (trade.is_short and new_trailing < (trade.trailing_stop_price or float("inf")))
+            ):
+                trade.trailing_stop_price = new_trailing
 
-    def status_dict(self) -> Dict:
-        self._refresh_daily()
+    # ── Stats ──────────────────────────────────────────────────────────────
+
+    def summary(self) -> Dict:
+        total_trades = len(self._closed_trades)
+        wins  = [t for t in self._closed_trades if t.realised_pnl > 0]
+        losses = [t for t in self._closed_trades if t.realised_pnl <= 0]
+        gross_profit = sum(t.realised_pnl for t in wins)
+        gross_loss   = abs(sum(t.realised_pnl for t in losses))
+
         return {
-            "capital": round(self.current_capital, 4),
-            "peak_capital": round(self.peak_capital, 4),
-            "drawdown_pct": round(self.current_drawdown * 100, 2),
-            "daily_pnl_pct": round(self.daily_pnl_pct * 100, 2),
-            "open_trades": len(self._open_trades),
-            "total_trades": self.total_trades,
-            "win_rate": round(self.win_rate * 100, 1),
-            "total_pnl": round(self.total_gross_pnl, 4),
-            "halted": self.trading_halted,
-            "daily_limit_hit": self.daily_limit_hit,
+            "capital":        round(self.capital, 4),
+            "total_pnl":      round(self._total_pnl, 4),
+            "daily_pnl":      round(self._daily_pnl, 4),
+            "drawdown_pct":   round(self.drawdown_pct * 100, 2),
+            "total_trades":   total_trades,
+            "wins":           len(wins),
+            "losses":         len(losses),
+            "win_rate":       round(len(wins) / total_trades * 100, 1) if total_trades else 0.0,
+            "profit_factor":  round(gross_profit / gross_loss, 2) if gross_loss > 0 else 0.0,
+            "open_trades":    len(self._open_trades),
+            "halted":         self._halted,
         }
+
+    def halt(self, reason: str = "manual"):
+        self._halted = True
+        logger.warning("Risk manager HALTED: %s", reason)
+
+    def resume(self):
+        self._halted = False
+        logger.info("Risk manager RESUMED")
+
+
+__all__ = ["RiskConfig", "RiskManager", "TradeRecord"]

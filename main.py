@@ -37,7 +37,10 @@ from api import DeltaRESTClient
 from backtest import Backtester, BacktestConfig
 from execution import ExecutionEngine
 from risk import RiskConfig, RiskManager
-from strategy import EMACrossoverStrategy, BollingerMeanReversionStrategy, SmartMoneyStrategy, load_strategy
+from strategy import (
+    EMACrossoverStrategy, BollingerMeanReversionStrategy,
+    SmartMoneyStrategy, load_strategy,
+)
 
 
 def load_env_keys():
