@@ -1,9 +1,0 @@
-2026-03-30 10:26:24,458  WARNING   main — DELTA_API_KEY / DELTA_API_SECRET not set. Live trading will fail — fine for backtesting.
-2026-03-30 12:17:37,473  WARNING   main — DELTA_API_KEY / DELTA_API_SECRET not set. Live trading will fail — fine for backtesting.
-2026-04-01 13:45:09,174  INFO      backtest — Backtesting SYNTH_SMART on 2000 bars with strategy=smart_money
-2026-04-01 13:45:30,636  INFO      backtest — Backtesting SYNTH_SMART on 2000 bars with strategy=smart_money
-2026-04-01 13:45:51,015  INFO      backtest — Backtesting SYNTH_SMART on 2000 bars with strategy=smart_money
-2026-04-01 14:22:08,551  INFO      backtest — Backtesting BTCUSD on 2000 bars with strategy=ema_crossover
-2026-04-01 14:23:24,813  INFO      backtest — Backtesting BTCUSD on 2000 bars with strategy=ema_crossover
-2026-04-01 15:21:32,571  INFO      backtest — Backtesting BTCUSD on 2000 bars with strategy=smart_money
-2026-04-01 15:23:36,531  INFO      backtest — Backtesting BTCUSD on 2000 bars with strategy=ema_crossover
