@@ -552,31 +552,49 @@ class ExecutionEngine:
             size=int(active_size),
             reduce_only=True,
         )
+        bracket_already_closed = False
         try:
             await self.rest.place_order(order)
             logger.info("Close order placed: %s %s @ %.4f (%s)", trade.symbol, trade.side, price, reason)
         except Exception as exc:
             exc_str = str(exc)
-            if "no_position_for_reduce_only" in exc_str:
+            if "no_position_for_reduce_only" in exc_str or "no open position" in exc_str.lower():
+                # Exchange bracket SL/TP already fired and closed the position.
+                # This is expected behaviour — not an error.
+                bracket_already_closed = True
                 logger.info(
-                    "Close skipped — exchange bracket already closed %s %s (reason=%s)",
+                    "ℹ️  Bracket already closed by exchange: %s %s (reason=%s) — syncing bot state",
                     trade.symbol, trade.side, reason,
                 )
+                # Use actual exit price from the exchange if we can fetch it quickly
+                try:
+                    fills = await self.rest.get_order_fills(trade.order_id)
+                    if fills:
+                        price = float(fills[-1].get("price", price))
+                        logger.info("Actual exit price from exchange fill: %.4f", price)
+                except Exception:
+                    pass  # Non-critical: use WS price as best estimate
             else:
-                logger.error("Close order failed: %s — position may still be open!", exc)
+                # Genuine failure — log loudly but still clean up bot state so
+                # a new trade can be entered. The bracket SL/TP remains active
+                # on the exchange as a safety net.
+                logger.error("Close order failed: %s — bracket SL/TP still active on exchange", exc)
                 try:
                     send(f"🚨 CLOSE FAILED: {trade.symbol} — {exc_str[:200]}")
                 except Exception:
                     pass
-                return
+                # Fall through — clean up bot state anyway so we don't get stuck
 
-        # Cancel remaining bracket SL/TP orders
-        try:
-            await self.rest.cancel_all_orders(self.product_id)
-        except Exception as exc:
-            logger.warning("Cancel bracket orders failed (non-critical): %s", exc)
+        # Cancel remaining bracket SL/TP orders ONLY when WE placed the close
+        # (not when the exchange already executed the bracket — cancelling in
+        # that case would remove the SL from the next position's bracket).
+        if not bracket_already_closed:
+            try:
+                await self.rest.cancel_all_orders(self.product_id)
+            except Exception as exc:
+                logger.warning("Cancel bracket orders failed (non-critical): %s", exc)
 
-        # Record and log
+        # Record and log — always do this so trade history stays accurate
         now = datetime.utcnow()
         self.risk.record_trade_close(trade, price, now, reason=reason)
         self.trade_logger.log(trade)
@@ -585,9 +603,10 @@ class ExecutionEngine:
         self._htf_cache_time = 0.0
 
         pnl_emoji = "✅" if trade.realised_pnl >= 0 else "❌"
+        close_source = "exchange bracket" if bracket_already_closed else "bot order"
         try:
             send(
-                f"{pnl_emoji} CLOSE ({reason})\n"
+                f"{pnl_emoji} CLOSE ({reason} via {close_source})\n"
                 f"{trade.side.upper()} {self.symbol}\n"
                 f"Entry: {trade.entry_price:.4f} → Exit: {price:.4f}\n"
                 f"Total PnL: {trade.realised_pnl:+.4f} USDT"
@@ -597,8 +616,9 @@ class ExecutionEngine:
 
         self._current_trade = None
         logger.info(
-            "EXIT (%s): %s %s | entry=%.4f exit=%.4f | total_pnl=%.4f USDT",
-            reason, trade.side, self.symbol, trade.entry_price, price, trade.realised_pnl,
+            "EXIT (%s, %s): %s %s | entry=%.4f exit=%.4f | total_pnl=%.4f USDT",
+            reason, close_source, trade.side, self.symbol,
+            trade.entry_price, price, trade.realised_pnl,
         )
 
     async def _force_close_position(self, position):

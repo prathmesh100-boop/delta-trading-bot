@@ -556,6 +556,14 @@ class DeltaRESTClient:
             logger.warning("Cancel all orders failed: %s", exc)
             return False
 
+    async def get_order_fills(self, order_id: str) -> List[Dict]:
+        """Fetch fills for a specific order to get the actual execution price."""
+        try:
+            resp = await self._request("GET", f"/v2/orders/{order_id}/fills")
+            return resp.get("result", [])
+        except Exception:
+            return []
+
     async def get_open_orders(self, product_id: Optional[int] = None) -> List[Dict]:
         params: Dict[str, Any] = {"state": "open"}
         if product_id:
