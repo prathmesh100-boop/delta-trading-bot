@@ -221,6 +221,11 @@ class DeltaRESTClient:
 
     def _sign(self, method: str, path: str, query_string: str, body: str, timestamp: str) -> str:
         message = method.upper() + timestamp + path + query_string + body
+        if "fill" in path.lower():
+            logger.debug(
+                "🔐 SIGNING: method=%s path=%s query=%s body=%s → message='%s'",
+                method.upper(), path, query_string, body[:50] if body else "", message
+            )
         return hmac.new(
             self.api_secret.encode("utf-8"),
             message.encode("utf-8"),
@@ -692,22 +697,40 @@ class DeltaRESTClient:
         try:
             params = {"order_id": order_id}
             resp   = await self._request("GET", "/v2/fills", params=params)
-            return resp.get("result", [])
+            result = resp.get("result", [])
+            if result:
+                logger.debug("✅ Fetched %d fills for order %s", len(result), order_id)
+            else:
+                logger.warning("⚠️ No fills returned for order %s (may not be filled yet)", order_id)
+            return result
         except Exception as exc:
-            logger.debug("get_order_fills(%s) failed: %s", order_id, exc)
+            logger.error("❌ get_order_fills(%s) FAILED: %s", order_id, exc)
             return []
 
     async def get_actual_fill_price(self, order_id: str, fallback: float) -> float:
-        """Return average fill price for an order, or fallback if not available."""
+        """Return average fill price for an order, or fallback if not available.
+        
+        SAFETY: If fallback is 0 or unreasonably low, raises error instead of returning it.
+        This prevents ghost trades where exit_price = 0.
+        """
         try:
             fills = await self.get_order_fills(order_id)
             if fills:
                 total_qty   = sum(float(f.get("size", 0)) for f in fills)
                 total_value = sum(float(f.get("price", 0)) * float(f.get("size", 0)) for f in fills)
                 if total_qty > 0:
-                    return total_value / total_qty
-        except Exception:
-            pass
+                    avg_price = total_value / total_qty
+                    logger.info("📊 Average fill price: %.4f (from %d fills)", avg_price, len(fills))
+                    return avg_price
+        except Exception as exc:
+            logger.warning("🚨 get_actual_fill_price fill fetch failed: %s (fallback=%.4f)", exc, fallback)
+        
+        # SAFETY CHECK: Don't use fallback if it's 0 or too low
+        if fallback <= 0:
+            logger.error("❌ CRITICAL: fallback price is %.4f (zero/invalid) — fetch failed and no valid fallback!", fallback)
+            raise ValueError(f"get_actual_fill_price: No fills found and fallback={fallback} is invalid")
+        
+        logger.info("⚠️ Using fallback price: %.4f (no fills fetched yet)", fallback)
         return fallback
 
     # ── Batch Orders ───────────────────────────────────────────────────────

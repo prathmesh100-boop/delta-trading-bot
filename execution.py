@@ -51,7 +51,7 @@ from api import (
 )
 from risk import RiskConfig, RiskManager, TradeRecord
 from strategy import BaseStrategy, Signal, SignalType
-from notifier import send, send_trade_alert
+from notifier import send, send_trade_alert, send_exit_alert
 
 logger = logging.getLogger(__name__)
 
@@ -497,16 +497,51 @@ class ExecutionEngine:
                     exit_price = await self.rest.get_actual_fill_price(
                         self._current_trade.order_id, fallback=exit_price
                     )
-                except Exception:
-                    pass
+                    logger.info(
+                        "✅ EXIT PRICE CONFIRMED: order_id=%s price=%.4f",
+                        self._current_trade.order_id, exit_price
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "❌ FILL PRICE FETCH FAILED: order_id=%s error=%s (latest_price fallback=%.4f)",
+                        self._current_trade.order_id, exc, self._latest_price
+                    )
+                    if self._latest_price <= 0:
+                        logger.critical(
+                            "🚨 CRITICAL: Exit price is INVALID (%.4f) — will retry next signal",
+                            self._latest_price
+                        )
+                        return
+                    exit_price = self._latest_price
 
                 async with self._close_lock:
                     if not self._current_trade.closed:
-                        self.risk.record_trade_close(
+                        net_pnl = self.risk.record_trade_close(
                             self._current_trade, exit_price, datetime.utcnow(), reason="bracket_exchange"
                         )
                         self.trade_logger.log(self._current_trade)
                         self._current_trade.closed = True
+                        
+                        # Determine exit reason (SL or TP)
+                        exit_reason = "bracket_exchange"
+                        if abs(exit_price - self._current_trade.stop_loss) < 0.0001:
+                            exit_reason = "stop_loss_hit"
+                        elif abs(exit_price - self._current_trade.take_profit) < 0.0001:
+                            exit_reason = "take_profit_hit"
+                        
+                        # Send exit notification
+                        try:
+                            send_exit_alert(
+                                self._current_trade.symbol,
+                                self._current_trade.side,
+                                self._current_trade.entry_price,
+                                exit_price,
+                                net_pnl,
+                                exit_reason
+                            )
+                        except Exception as exc:
+                            logger.warning("Exit notification failed: %s", exc)
+                        
                         self._current_trade = None
                         self._last_exchange_sl = None
         except Exception as exc:
@@ -671,9 +706,13 @@ class ExecutionEngine:
                         actual_exit_price = await self.rest.get_actual_fill_price(
                             trade.order_id, fallback=price
                         )
-                        logger.info("Actual fill price from exchange: %.4f", actual_exit_price)
-                    except Exception:
-                        pass
+                        logger.info("✅ Actual fill price from exchange: %.4f", actual_exit_price)
+                    except Exception as exc:
+                        logger.warning(
+                            "⚠️  Fill price fetch failed: %s (using fallback=%.4f)",
+                            exc, price
+                        )
+                        actual_exit_price = price
             else:
                 logger.error("Manual close failed: %s — bracket SL/TP still active on exchange", exc)
                 try:
@@ -691,7 +730,6 @@ class ExecutionEngine:
         self._htf_cache_time  = 0.0   # Force fresh HTF data for next entry
 
         source = "exchange bracket" if bracket_already_closed else "manual close"
-        pnl_emoji = "✅" if net_pnl >= 0 else "❌"
 
         logger.info(
             "EXIT (%s via %s): %s %s | entry=%.4f exit=%.4f | pnl=%.4f USDT | capital=%.2f",
@@ -700,15 +738,19 @@ class ExecutionEngine:
             self.risk.capital,
         )
 
+        # Send exit notification
         try:
-            send(
-                f"{pnl_emoji} CLOSE ({reason} / {source})\n"
-                f"{trade.side.upper()} {self.symbol}\n"
-                f"Entry: {trade.entry_price:.4f} → Exit: {actual_exit_price:.4f}\n"
-                f"PnL: {net_pnl:+.4f} USDT | Capital: {self.risk.capital:.2f} USDT"
+            exit_reason = reason if bracket_already_closed else "manual_" + reason
+            send_exit_alert(
+                trade.symbol,
+                trade.side,
+                trade.entry_price,
+                actual_exit_price,
+                net_pnl,
+                exit_reason
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Exit notification failed: %s", exc)
 
     async def _force_close_position(self, position):
         """Emergency close for orphaned positions detected at startup."""
