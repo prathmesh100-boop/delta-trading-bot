@@ -21,34 +21,29 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import pandas as pd
-        try:
-            atr_s = self.strategy.atr(df, 14)
-            atr_now = float(atr_s.iloc[-1])
-            atr_ma = float(atr_s.rolling(30).mean().iloc[-1])
-            if atr_ma > 0 and atr_now < atr_ma * 0.7:
-                log_decision_csv({
-                    "timestamp": _dt.utcnow().isoformat(),
-                    "symbol": self.symbol,
-                    "regime": regime if 'regime' in locals() else None,
-                    "htf_trend": htf,
-                    "signal_type": signal.type.name,
-                    "confidence": getattr(signal, "confidence", 1.0),
-                    "volume_ratio": vol_ratio,
-                    "ema_slope": ema_slope,
-                    "liquidity_sweep": liquidity_sweep,
-                    "atr": atr_now,
-                    "atr_ma": atr_ma,
-                    "spread": spread,
-                    "ob_imbalance": imb,
-                    "decision": "SKIP",
-                    "reason": "low_vol",
-                })
-                logger.info("[SKIP] reason=low_vol atr=%.6f atr_ma=%.6f", atr_now, atr_ma)
-                return
-        except Exception:
-            # if ATR calc fails, continue (do not block on indicator errors)
-            atr_now = None
-            atr_ma = None
+import os
+import csv
+
+# logging helper
+logger = logging.getLogger(__name__)
+
+# decisions CSV helper
+DECISIONS_CSV = os.path.join(os.getcwd(), "decisions.csv")
+
+def log_decision_csv(row: dict, file: str = DECISIONS_CSV) -> None:
+    """Append a decision row to CSV, creating header if needed."""
+    if not isinstance(row, dict):
+        return
+    write_header = not os.path.exists(file)
+    try:
+        with open(file, "a", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=list(row.keys()))
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+    except Exception:
+        # CSV logging must never crash the engine
+        logger.exception("Failed to write decision CSV")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Execution Engine
@@ -390,6 +385,8 @@ class ExecutionEngine:
 
         # Precompute observability metrics for CSV logging
         from datetime import datetime as _dt
+        # ensure regime exists before any early-returns that log it
+        regime = None
         hour = _dt.utcnow().hour
         avg_v = df["volume"].rolling(20).mean().iloc[-1] if len(df) >= 20 else float("nan")
         curr_v = df["volume"].iloc[-1]
@@ -443,7 +440,7 @@ class ExecutionEngine:
             log_decision_csv({
                 "timestamp": _dt.utcnow().isoformat(),
                 "symbol": self.symbol,
-                "regime": regime if 'regime' in locals() else None,
+                "regime": regime,
                 "htf_trend": htf,
                 "signal_type": signal.type.name,
                 "confidence": getattr(signal, "confidence", 1.0),
@@ -470,6 +467,23 @@ class ExecutionEngine:
             atr_now = float(atr_s.iloc[-1])
             atr_ma = float(atr_s.rolling(30).mean().iloc[-1])
             if atr_ma > 0 and atr_now < atr_ma * 0.7:
+                log_decision_csv({
+                    "timestamp": _dt.utcnow().isoformat(),
+                    "symbol": self.symbol,
+                    "regime": regime,
+                    "htf_trend": htf,
+                    "signal_type": signal.type.name,
+                    "confidence": getattr(signal, "confidence", 1.0),
+                    "volume_ratio": vol_ratio,
+                    "ema_slope": ema_slope,
+                    "liquidity_sweep": liquidity_sweep,
+                    "atr": atr_now,
+                    "atr_ma": atr_ma,
+                    "spread": spread,
+                    "ob_imbalance": imb,
+                    "decision": "SKIP",
+                    "reason": "low_vol",
+                })
                 logger.info("[SKIP] reason=low_vol atr=%.6f atr_ma=%.6f", atr_now, atr_ma)
                 return
         except Exception:
@@ -482,6 +496,23 @@ class ExecutionEngine:
             logger.debug("Regime unknown — proceeding without weighting")
         else:
             if regime == "volatile":
+                log_decision_csv({
+                    "timestamp": _dt.utcnow().isoformat(),
+                    "symbol": self.symbol,
+                    "regime": regime,
+                    "htf_trend": htf,
+                    "signal_type": signal.type.name,
+                    "confidence": getattr(signal, "confidence", 1.0),
+                    "volume_ratio": vol_ratio,
+                    "ema_slope": ema_slope,
+                    "liquidity_sweep": liquidity_sweep,
+                    "atr": atr_now if atr_now is not None else None,
+                    "atr_ma": atr_ma if atr_ma is not None else None,
+                    "spread": spread,
+                    "ob_imbalance": imb,
+                    "decision": "SKIP",
+                    "reason": "regime_volatile",
+                })
                 logger.info("[SKIP] reason=regime=volatile")
                 return
             if regime == "trend":
@@ -497,12 +528,47 @@ class ExecutionEngine:
         if self.confidence_min > 0:
             conf = getattr(signal, "confidence", 1.0)
             if conf < self.confidence_min:
+                log_decision_csv({
+                    "timestamp": _dt.utcnow().isoformat(),
+                    "symbol": self.symbol,
+                    "regime": regime,
+                    "htf_trend": htf,
+                    "signal_type": signal.type.name,
+                    "confidence": conf,
+                    "volume_ratio": vol_ratio,
+                    "ema_slope": ema_slope,
+                    "liquidity_sweep": liquidity_sweep,
+                    "atr": atr_now if atr_now is not None else None,
+                    "atr_ma": atr_ma if atr_ma is not None else None,
+                    "spread": spread,
+                    "ob_imbalance": imb,
+                    "decision": "SKIP",
+                    "reason": "low_confidence",
+                })
                 logger.info("[SKIP] reason=confidence conf=%.2f < %.2f", conf, self.confidence_min)
                 return
 
         # Trade frequency cooldown
         if time.time() - self._last_entry_ts < 900:
-            logger.info("[SKIP] reason=cooldown remaining=%.0fs", 900 - (time.time() - self._last_entry_ts))
+            remaining = 900 - (time.time() - self._last_entry_ts)
+            log_decision_csv({
+                "timestamp": _dt.utcnow().isoformat(),
+                "symbol": self.symbol,
+                "regime": regime,
+                "htf_trend": htf,
+                "signal_type": signal.type.name,
+                "confidence": getattr(signal, "confidence", 1.0),
+                "volume_ratio": vol_ratio,
+                "ema_slope": ema_slope,
+                "liquidity_sweep": liquidity_sweep,
+                "atr": atr_now if atr_now is not None else None,
+                "atr_ma": atr_ma if atr_ma is not None else None,
+                "spread": spread,
+                "ob_imbalance": imb,
+                "decision": "SKIP",
+                "reason": "cooldown",
+            })
+            logger.info("[SKIP] reason=cooldown remaining=%.0fs", remaining)
             return
 
         # Higher-timeframe trend filter: only trade with 50/200 EMA direction
@@ -517,9 +583,43 @@ class ExecutionEngine:
 
         htf = _htf_trend(df)
         if signal.type == SignalType.LONG and htf != "bull":
+            log_decision_csv({
+                "timestamp": _dt.utcnow().isoformat(),
+                "symbol": self.symbol,
+                "regime": regime,
+                "htf_trend": htf,
+                "signal_type": signal.type.name,
+                "confidence": getattr(signal, "confidence", 1.0),
+                "volume_ratio": vol_ratio,
+                "ema_slope": ema_slope,
+                "liquidity_sweep": liquidity_sweep,
+                "atr": atr_now if atr_now is not None else None,
+                "atr_ma": atr_ma if atr_ma is not None else None,
+                "spread": spread,
+                "ob_imbalance": imb,
+                "decision": "SKIP",
+                "reason": "htf_mismatch",
+            })
             logger.info("[SKIP] reason=htf_mismatch htf=%s", htf)
             return
         if signal.type == SignalType.SHORT and htf != "bear":
+            log_decision_csv({
+                "timestamp": _dt.utcnow().isoformat(),
+                "symbol": self.symbol,
+                "regime": regime,
+                "htf_trend": htf,
+                "signal_type": signal.type.name,
+                "confidence": getattr(signal, "confidence", 1.0),
+                "volume_ratio": vol_ratio,
+                "ema_slope": ema_slope,
+                "liquidity_sweep": liquidity_sweep,
+                "atr": atr_now if atr_now is not None else None,
+                "atr_ma": atr_ma if atr_ma is not None else None,
+                "spread": spread,
+                "ob_imbalance": imb,
+                "decision": "SKIP",
+                "reason": "htf_mismatch",
+            })
             logger.info("[SKIP] reason=htf_mismatch htf=%s", htf)
             return
 
@@ -528,9 +628,43 @@ class ExecutionEngine:
         if self.ob_imbalance_min > 0 and self._ob is not None:
             imb = self._ob.imbalance(levels=5)
             if signal.type == SignalType.LONG and imb < self.ob_imbalance_min:
+                log_decision_csv({
+                    "timestamp": _dt.utcnow().isoformat(),
+                    "symbol": self.symbol,
+                    "regime": regime,
+                    "htf_trend": htf,
+                    "signal_type": signal.type.name,
+                    "confidence": getattr(signal, "confidence", 1.0),
+                    "volume_ratio": vol_ratio,
+                    "ema_slope": ema_slope,
+                    "liquidity_sweep": liquidity_sweep,
+                    "atr": atr_now if atr_now is not None else None,
+                    "atr_ma": atr_ma if atr_ma is not None else None,
+                    "spread": spread,
+                    "ob_imbalance": imb,
+                    "decision": "SKIP",
+                    "reason": "ob_imbalance_low",
+                })
                 logger.info("[SKIP] reason=ob_imbalance imb=%.3f < %.3f", imb, self.ob_imbalance_min)
                 return
             if signal.type == SignalType.SHORT and imb > -self.ob_imbalance_min:
+                log_decision_csv({
+                    "timestamp": _dt.utcnow().isoformat(),
+                    "symbol": self.symbol,
+                    "regime": regime,
+                    "htf_trend": htf,
+                    "signal_type": signal.type.name,
+                    "confidence": getattr(signal, "confidence", 1.0),
+                    "volume_ratio": vol_ratio,
+                    "ema_slope": ema_slope,
+                    "liquidity_sweep": liquidity_sweep,
+                    "atr": atr_now if atr_now is not None else None,
+                    "atr_ma": atr_ma if atr_ma is not None else None,
+                    "spread": spread,
+                    "ob_imbalance": imb,
+                    "decision": "SKIP",
+                    "reason": "ob_imbalance_not_bearish",
+                })
                 logger.info("[SKIP] reason=ob_imbalance imb=%.3f not bearish", imb)
                 return
 
@@ -539,6 +673,23 @@ class ExecutionEngine:
         if self._ob is not None:
             spread = self._ob.spread()
             if spread is not None and spread > price * 0.001:
+                log_decision_csv({
+                    "timestamp": _dt.utcnow().isoformat(),
+                    "symbol": self.symbol,
+                    "regime": regime,
+                    "htf_trend": htf,
+                    "signal_type": signal.type.name,
+                    "confidence": getattr(signal, "confidence", 1.0),
+                    "volume_ratio": vol_ratio,
+                    "ema_slope": ema_slope,
+                    "liquidity_sweep": liquidity_sweep,
+                    "atr": atr_now if atr_now is not None else None,
+                    "atr_ma": atr_ma if atr_ma is not None else None,
+                    "spread": spread,
+                    "ob_imbalance": imb,
+                    "decision": "SKIP",
+                    "reason": "wide_spread",
+                })
                 logger.info("[SKIP] reason=wide_spread spread=%.6f price_thresh=%.6f", spread, price * 0.001)
                 return
 
@@ -565,11 +716,22 @@ class ExecutionEngine:
             f"{imb:.3f}" if imb is not None else "n/a",
         )
 
-        await self._execute_entry(signal, price)
+        context = {
+            "regime": regime,
+            "htf": htf,
+            "vol_ratio": vol_ratio,
+            "ema_slope": ema_slope,
+            "liquidity_sweep": liquidity_sweep,
+            "atr": atr_now if 'atr_now' in locals() else None,
+            "atr_ma": atr_ma if 'atr_ma' in locals() else None,
+            "spread": spread,
+            "imb": imb,
+        }
+        await self._execute_entry(signal, price, context)
 
     # ── Entry ──────────────────────────────────────────────────────────────
 
-    async def _execute_entry(self, signal: Signal, price: float):
+    async def _execute_entry(self, signal: Signal, price: float, context: dict):
         """Place bracket order for new entry."""
         if self._current_trade and not self._current_trade.closed:
             logger.debug("Skipping entry — trade already open")
@@ -623,6 +785,28 @@ class ExecutionEngine:
         self._current_trade = trade
         self.risk.register_trade(trade)
         self._last_entry_ts = time.time()
+
+        # Log ENTRY to decisions CSV for downstream analysis
+        try:
+            log_decision_csv({
+                "timestamp": datetime.utcnow().isoformat(),
+                "symbol": self.symbol,
+                "regime": context.get("regime"),
+                "htf_trend": context.get("htf"),
+                "signal_type": signal.type.name,
+                "confidence": getattr(signal, "confidence", 1.0),
+                "volume_ratio": context.get("vol_ratio"),
+                "ema_slope": context.get("ema_slope"),
+                "liquidity_sweep": context.get("liquidity_sweep"),
+                "atr": context.get("atr"),
+                "atr_ma": context.get("atr_ma"),
+                "spread": context.get("spread"),
+                "ob_imbalance": context.get("imb"),
+                "decision": "ENTRY",
+                "reason": "",
+            })
+        except Exception:
+            logger.exception("Failed to write ENTRY to decision CSV")
 
         logger.info(
             "✅ ENTRY: %s %s %d lots @ %.4f | SL=%.4f | TP=%s | order=%s",
@@ -685,7 +869,11 @@ class ExecutionEngine:
             trade.symbol, trade.side.upper(),
             trade.entry_price, exit_price, reason
         )
-        send(f"🏁 CLOSED {trade.symbol} {trade.side.upper()} @ {exit_price:.4f} | {reason}")
+        try:
+            from notifier import send_exit_alert
+            send_exit_alert(trade.symbol, trade.side, trade.entry_price, exit_price, pnl, reason)
+        except Exception:
+            logger.exception("Failed to send exit alert")
 
         self._current_trade = None
 

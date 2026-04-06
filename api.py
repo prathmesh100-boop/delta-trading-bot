@@ -1146,7 +1146,7 @@ class DeltaWSClient:
                     ping_interval  = None,   # we handle ping manually
                     close_timeout  = 5,
                     max_size       = 2 ** 20,
-                    extra_headers  = {"User-Agent": "DeltaAlgoBot/6.0"},
+                    additional_headers  = {"User-Agent": "DeltaAlgoBot/6.0"},
                 ) as ws:
                     self._ws = ws
                     backoff  = 2
