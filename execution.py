@@ -147,8 +147,14 @@ class ExecutionEngine:
 
         # Set leverage
         leverage = self.risk.config.leverage
-        await self.rest.set_leverage(self.product_id, int(leverage))
-        logger.info("Leverage set to %dx", int(leverage))
+        try:
+            # Some Delta API deployments (e.g. Delta India) do not support
+            # changing leverage via API. Call if available, otherwise fall
+            # back to using manual/configured leverage and continue.
+            await self.rest.set_leverage(self.product_id, int(leverage))
+            logger.info("Leverage set to %dx", int(leverage))
+        except Exception:
+            logger.info("Leverage API not supported; using manual leverage: %dx", int(leverage))
 
     async def _force_close_position(self, pos) -> bool:
         """Emergency close: place market reduce-only order."""
