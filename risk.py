@@ -16,6 +16,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
+from strategy import Signal
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,8 @@ class RiskManager:
         self.config          = config
         self.initial_capital = initial_capital
         self.current_equity  = initial_capital
+        # backward-compatible alias used in tests
+        self.current_capital = initial_capital
         self._peak_equity    = initial_capital
         self._daily_start_equity = initial_capital
         self._daily_reset_date   = datetime.now(timezone.utc).date()
@@ -103,6 +106,7 @@ class RiskManager:
         if new_equity <= 0:
             return
         self.current_equity = new_equity
+        self.current_capital = new_equity
         if new_equity > self._peak_equity:
             self._peak_equity = new_equity
 
@@ -154,9 +158,34 @@ class RiskManager:
 
     # ── Position Sizing ────────────────────────────────────────────────────
 
-    def calculate_position_size(
-        self, equity: float, entry_price: float, sl_distance: float
-    ) -> float:
+    def calculate_position_size(self, *args, **kwargs) -> float:
+        """
+        Flexible position size API.
+
+        Supports two calling conventions:
+          1) (equity: float, entry_price: float, sl_distance: float)
+          2) (signal: Signal, current_price: float = ..., symbol: str = ...)
+        """
+        # Backwards-compatible signature
+        if args and isinstance(args[0], Signal):
+            sig: Signal = args[0]
+            entry_price = float(kwargs.get("current_price", sig.price or 0.0))
+            stop_loss = sig.stop_loss
+            if stop_loss is None:
+                return 0.0
+            sl_distance = abs(entry_price - float(stop_loss))
+            equity = self.current_equity
+        else:
+            # legacy signature
+            if len(args) >= 3:
+                equity = float(args[0])
+                entry_price = float(args[1])
+                sl_distance = float(args[2])
+            else:
+                # allow kwargs
+                equity = float(kwargs.get("equity", self.current_equity))
+                entry_price = float(kwargs.get("entry_price", 0.0))
+                sl_distance = float(kwargs.get("sl_distance", 0.0))
         """
         Calculate USD notional for position.
 
@@ -179,6 +208,30 @@ class RiskManager:
         )
         return notional
 
+    def check_signal(self, sig: Signal) -> bool:
+        """
+        Quick signal-level check respecting daily loss / circuit breaker.
+        Tests may set `current_capital` on the manager, so prefer that when present.
+        """
+        equity = getattr(self, "current_capital", None)
+        if equity is None:
+            equity = self.current_equity
+
+        # Basic guards
+        if equity <= 0:
+            return False
+
+        # Daily loss guard
+        daily_loss = (self._daily_start_equity - equity) / self._daily_start_equity if self._daily_start_equity > 0 else 0.0
+        if daily_loss >= self.config.daily_loss_limit_pct:
+            return False
+
+        # Circuit-breaker / drawdown
+        if not self.can_trade():
+            return False
+
+        return True
+
     def get_leverage_for_symbol(self, symbol: str) -> float:
         return self.config.leverage_by_symbol.get(symbol, self.config.leverage)
 
@@ -194,6 +247,7 @@ class RiskManager:
         self._closed_trades.append(trade)
         pnl = trade.net_pnl or 0.0
         self.current_equity += pnl
+        self.current_capital = self.current_equity
         if self.current_equity > self._peak_equity:
             self._peak_equity = self.current_equity
         logger.info("Trade closed: %s pnl=%.2f equity=%.2f", trade.symbol, pnl, self.current_equity)

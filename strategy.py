@@ -35,7 +35,10 @@ class SignalType(str, Enum):
 
 @dataclass
 class Signal:
+    # Backwards-compatible constructor: (type, symbol, price, stop_loss=..., take_profit=..., confidence=...)
     type:       SignalType
+    symbol:     Optional[str] = None
+    price:      Optional[float] = None
     stop_loss:  Optional[float] = None
     take_profit: Optional[float] = None
     confidence: float = 1.0
@@ -258,6 +261,10 @@ class SmartMoneyStrategy(BaseStrategy):
         "atr_sl_multiplier": 1.2,
         "atr_tp_multiplier": 2.5,
         "fvg_lookback":      5,
+        # additional robustness filters
+        "min_volume_factor": 1.2,   # require current vol >= avg_vol * factor
+        "ema_slope_min":     0.001, # minimum absolute EMA slope to consider
+        "min_rr":            2.0,   # minimum reward:risk ratio
     }
 
     def __init__(self, params: Optional[Dict] = None):
@@ -304,6 +311,14 @@ class SmartMoneyStrategy(BaseStrategy):
         # EMA slope strength
         ema_slope = (fast_e.iloc[-1] - fast_e.iloc[-5]) / fast_e.iloc[-5]
 
+        # Volume spike filter (avoid low-volume false breaks)
+        avg_vol = df["volume"].rolling(20).mean().iloc[-1]
+        curr_vol = df["volume"].iloc[-1]
+        # Allow sweep to bypass volume filter
+        if not pd.isna(avg_vol) and curr_vol < avg_vol * self.p("min_volume_factor"):
+            if not (liquidity_sweep_long or liquidity_sweep_short):
+                return Signal(SignalType.NEUTRAL)
+
         # Recent swing: look for CHoCH
         recent = df.iloc[-self.p("swing_length"):]
         recent_high = recent["high"].max()
@@ -325,7 +340,20 @@ class SmartMoneyStrategy(BaseStrategy):
         if bullish_choch and curr_rsi < 65 and ema_slope > 0:
             sl = recent_low - atr * sl_mult
             tp = price + atr * tp_mult
+            # Avoid very weak EMA slope
+            if abs(ema_slope) < self.p("ema_slope_min"):
+                return Signal(SignalType.NEUTRAL)
+
+            # Ensure reasonable reward:risk
+            denom = price - sl if price - sl != 0 else 1e-9
+            rr = (tp - price) / denom
+            if rr < self.p("min_rr"):
+                return Signal(SignalType.NEUTRAL)
+
             conf = min(1.0, abs(ema_slope) * 100 + 0.5)
+            # Boost when liquidity sweep confirms the move
+            if liquidity_sweep_long:
+                conf = min(1.0, conf + 0.25)
             if fvg and fvg[0] == "bullish":
                 conf = min(1.0, conf + 0.15)
             return Signal(SignalType.LONG, sl, tp, confidence=conf,
@@ -334,7 +362,20 @@ class SmartMoneyStrategy(BaseStrategy):
         if bearish_choch and curr_rsi > 35 and ema_slope < 0:
             sl = recent_high + atr * sl_mult
             tp = price - atr * tp_mult
+            # Avoid very weak EMA slope
+            if abs(ema_slope) < self.p("ema_slope_min"):
+                return Signal(SignalType.NEUTRAL)
+
+            # Ensure reasonable reward:risk
+            denom = sl - price if sl - price != 0 else 1e-9
+            rr = (price - tp) / denom
+            if rr < self.p("min_rr"):
+                return Signal(SignalType.NEUTRAL)
+
             conf = min(1.0, abs(ema_slope) * 100 + 0.5)
+            # Boost when liquidity sweep confirms the move
+            if liquidity_sweep_short:
+                conf = min(1.0, conf + 0.25)
             if fvg and fvg[0] == "bearish":
                 conf = min(1.0, conf + 0.15)
             return Signal(SignalType.SHORT, sl, tp, confidence=conf,

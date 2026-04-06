@@ -21,18 +21,34 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import pandas as pd
-
-from api import (
-    DeltaRESTClient, DeltaWSClient,
-    OrderSide, OrderStatus, StopTriggerMethod,
-    DeltaAPIError, L2OrderBook,
-)
-from risk import RiskConfig, RiskManager, TradeRecord
-from strategy import BaseStrategy, Signal, SignalType
-from notifier import send_trade_alert, send
-
-logger = logging.getLogger(__name__)
-
+        try:
+            atr_s = self.strategy.atr(df, 14)
+            atr_now = float(atr_s.iloc[-1])
+            atr_ma = float(atr_s.rolling(30).mean().iloc[-1])
+            if atr_ma > 0 and atr_now < atr_ma * 0.7:
+                log_decision_csv({
+                    "timestamp": _dt.utcnow().isoformat(),
+                    "symbol": self.symbol,
+                    "regime": regime if 'regime' in locals() else None,
+                    "htf_trend": htf,
+                    "signal_type": signal.type.name,
+                    "confidence": getattr(signal, "confidence", 1.0),
+                    "volume_ratio": vol_ratio,
+                    "ema_slope": ema_slope,
+                    "liquidity_sweep": liquidity_sweep,
+                    "atr": atr_now,
+                    "atr_ma": atr_ma,
+                    "spread": spread,
+                    "ob_imbalance": imb,
+                    "decision": "SKIP",
+                    "reason": "low_vol",
+                })
+                logger.info("[SKIP] reason=low_vol atr=%.6f atr_ma=%.6f", atr_now, atr_ma)
+                return
+        except Exception:
+            # if ATR calc fails, continue (do not block on indicator errors)
+            atr_now = None
+            atr_ma = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Execution Engine
@@ -82,6 +98,10 @@ class ExecutionEngine:
         self._ws_mark:  float = 0.0
         self._ob:       Optional[L2OrderBook] = None
         self._shutdown  = False
+        # Regime detector for adaptive strategy switching
+        self.regime = RegimeDetector()
+        # last entry timestamp (cooldown between trades)
+        self._last_entry_ts: float = 0.0
 
     # ── Startup ────────────────────────────────────────────────────────────
 
@@ -368,26 +388,182 @@ class ExecutionEngine:
         if not signal or signal.type == SignalType.NEUTRAL:
             return
 
+        # Precompute observability metrics for CSV logging
+        from datetime import datetime as _dt
+        hour = _dt.utcnow().hour
+        avg_v = df["volume"].rolling(20).mean().iloc[-1] if len(df) >= 20 else float("nan")
+        curr_v = df["volume"].iloc[-1]
+        vol_ratio = None if pd.isna(avg_v) or avg_v == 0 else float(curr_v / avg_v)
+
+        # EMA slope proxy (8-period over 5 bars)
+        try:
+            ema8 = df["close"].ewm(span=8, adjust=False).mean()
+            ema_slope = float((ema8.iloc[-1] - ema8.iloc[-5]) / ema8.iloc[-5]) if len(ema8) >= 5 and ema8.iloc[-5] != 0 else None
+        except Exception:
+            ema_slope = None
+
+        # local liquidity sweep detection
+        last_high = df["high"].iloc[-5:-1].max() if len(df) >= 6 else None
+        last_low = df["low"].iloc[-5:-1].min() if len(df) >= 6 else None
+        liquidity_sweep = False
+        if signal.type == SignalType.LONG and last_low is not None and df["low"].iloc[-1] < last_low:
+            liquidity_sweep = True
+        if signal.type == SignalType.SHORT and last_high is not None and df["high"].iloc[-1] > last_high:
+            liquidity_sweep = True
+
+        # HTF trend (50/200)
+        try:
+            ema50 = df["close"].ewm(span=50, adjust=False).mean().iloc[-1]
+            ema200 = df["close"].ewm(span=200, adjust=False).mean().iloc[-1]
+            if ema50 > ema200:
+                htf = "bull"
+            elif ema50 < ema200:
+                htf = "bear"
+            else:
+                htf = "neutral"
+        except Exception:
+            htf = "neutral"
+
+        # orderbook metrics
+        imb = None
+        spread = None
+        if self._ob is not None:
+            try:
+                imb = self._ob.imbalance(levels=5)
+            except Exception:
+                imb = None
+            try:
+                spread = self._ob.spread()
+            except Exception:
+                spread = None
+
+        boost_session = False
+        if hour < 6:
+            # log CSV and skip
+            log_decision_csv({
+                "timestamp": _dt.utcnow().isoformat(),
+                "symbol": self.symbol,
+                "regime": regime if 'regime' in locals() else None,
+                "htf_trend": htf,
+                "signal_type": signal.type.name,
+                "confidence": getattr(signal, "confidence", 1.0),
+                "volume_ratio": vol_ratio,
+                "ema_slope": ema_slope,
+                "liquidity_sweep": liquidity_sweep,
+                "atr": atr_now if 'atr_now' in locals() else None,
+                "atr_ma": atr_ma if 'atr_ma' in locals() else None,
+                "spread": spread,
+                "ob_imbalance": imb,
+                "decision": "SKIP",
+                "reason": "session",
+            })
+            logger.info("[SKIP] reason=session hour=%d (low liquidity)", hour)
+            return
+        if 13 <= hour <= 17:
+            boost_session = True
+
+        # Volatility filter: skip very low ATR regimes
+        atr_now = None
+        atr_ma = None
+        try:
+            atr_s = self.strategy.atr(df, 14)
+            atr_now = float(atr_s.iloc[-1])
+            atr_ma = float(atr_s.rolling(30).mean().iloc[-1])
+            if atr_ma > 0 and atr_now < atr_ma * 0.7:
+                logger.info("[SKIP] reason=low_vol atr=%.6f atr_ma=%.6f", atr_now, atr_ma)
+                return
+        except Exception:
+            # if ATR calc fails, continue (do not block on indicator errors)
+            pass
+
+        # Regime-based confidence weighting (soft switch)
+        regime = self.regime.detect_regime(df)
+        if regime is None:
+            logger.debug("Regime unknown — proceeding without weighting")
+        else:
+            if regime == "volatile":
+                logger.info("[SKIP] reason=regime=volatile")
+                return
+            if regime == "trend":
+                signal.confidence = getattr(signal, "confidence", 1.0) * 1.2
+            elif regime == "range":
+                signal.confidence = getattr(signal, "confidence", 1.0) * 0.8
+
+        # Session boost
+        if boost_session:
+            signal.confidence = min(1.0, getattr(signal, "confidence", 1.0) * 1.15)
+
         # Confidence filter (AI/ML threshold)
         if self.confidence_min > 0:
             conf = getattr(signal, "confidence", 1.0)
             if conf < self.confidence_min:
-                logger.debug("Signal confidence %.2f < %.2f — skipped", conf, self.confidence_min)
+                logger.info("[SKIP] reason=confidence conf=%.2f < %.2f", conf, self.confidence_min)
                 return
 
+        # Trade frequency cooldown
+        if time.time() - self._last_entry_ts < 900:
+            logger.info("[SKIP] reason=cooldown remaining=%.0fs", 900 - (time.time() - self._last_entry_ts))
+            return
+
+        # Higher-timeframe trend filter: only trade with 50/200 EMA direction
+        def _htf_trend(local_df: pd.DataFrame) -> str:
+            ema50 = local_df["close"].ewm(span=50, adjust=False).mean().iloc[-1]
+            ema200 = local_df["close"].ewm(span=200, adjust=False).mean().iloc[-1]
+            if ema50 > ema200:
+                return "bull"
+            if ema50 < ema200:
+                return "bear"
+            return "neutral"
+
+        htf = _htf_trend(df)
+        if signal.type == SignalType.LONG and htf != "bull":
+            logger.info("[SKIP] reason=htf_mismatch htf=%s", htf)
+            return
+        if signal.type == SignalType.SHORT and htf != "bear":
+            logger.info("[SKIP] reason=htf_mismatch htf=%s", htf)
+            return
+
         # Orderbook imbalance filter
+        imb = None
         if self.ob_imbalance_min > 0 and self._ob is not None:
             imb = self._ob.imbalance(levels=5)
             if signal.type == SignalType.LONG and imb < self.ob_imbalance_min:
-                logger.debug("OB imbalance %.3f < %.3f for LONG — skipped", imb, self.ob_imbalance_min)
+                logger.info("[SKIP] reason=ob_imbalance imb=%.3f < %.3f", imb, self.ob_imbalance_min)
                 return
             if signal.type == SignalType.SHORT and imb > -self.ob_imbalance_min:
-                logger.debug("OB imbalance %.3f not bearish enough for SHORT — skipped", imb, self.ob_imbalance_min)
+                logger.info("[SKIP] reason=ob_imbalance imb=%.3f not bearish", imb)
                 return
 
-        logger.info("📊 Signal: %s | sl=%.4f | tp=%.4f | conf=%.2f",
-                    signal.type.name, signal.stop_loss or 0,
-                    signal.take_profit or 0, getattr(signal, "confidence", 1.0))
+        # Spread / liquidity filter — avoid wide spreads
+        spread = None
+        if self._ob is not None:
+            spread = self._ob.spread()
+            if spread is not None and spread > price * 0.001:
+                logger.info("[SKIP] reason=wide_spread spread=%.6f price_thresh=%.6f", spread, price * 0.001)
+                return
+
+        # Observability / decision logging
+        avg_v = df["volume"].rolling(20).mean().iloc[-1]
+        curr_v = df["volume"].iloc[-1]
+        vol_ok = (curr_v >= avg_v) if not pd.isna(avg_v) and avg_v > 0 else None
+        # local liquidity sweep detection for extra visibility
+        last_high = df["high"].iloc[-5:-1].max() if len(df) >= 6 else None
+        last_low = df["low"].iloc[-5:-1].min() if len(df) >= 6 else None
+        liquidity_sweep = False
+        if signal.type == SignalType.LONG and last_low is not None and df["low"].iloc[-1] < last_low:
+            liquidity_sweep = True
+        if signal.type == SignalType.SHORT and last_high is not None and df["high"].iloc[-1] > last_high:
+            liquidity_sweep = True
+
+        logger.info(
+            "[DECISION] regime=%s htf=%s conf=%.2f vol_ok=%s sweep=%s atr=%s atr_ma=%s spread=%s ob=%s",
+            regime, htf, getattr(signal, "confidence", 1.0),
+            vol_ok, liquidity_sweep,
+            f"{atr_now:.6f}" if atr_now is not None else "n/a",
+            f"{atr_ma:.6f}" if atr_ma is not None else "n/a",
+            f"{spread:.6f}" if spread is not None else "n/a",
+            f"{imb:.3f}" if imb is not None else "n/a",
+        )
 
         await self._execute_entry(signal, price)
 
@@ -446,6 +622,7 @@ class ExecutionEngine:
         )
         self._current_trade = trade
         self.risk.register_trade(trade)
+        self._last_entry_ts = time.time()
 
         logger.info(
             "✅ ENTRY: %s %s %d lots @ %.4f | SL=%.4f | TP=%s | order=%s",
