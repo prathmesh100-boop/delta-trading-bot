@@ -24,6 +24,19 @@ import pandas as pd
 import os
 import csv
 
+# Required external types and helpers
+from api import (
+    DeltaRESTClient,
+    DeltaAPIError,
+    StopTriggerMethod,
+    OrderSide,
+    DeltaWSClient,
+    L2OrderBook,
+)
+from strategy import BaseStrategy, Signal, SignalType
+from risk import RiskManager, TradeRecord
+from regime import RegimeDetector
+
 # logging helper
 logger = logging.getLogger(__name__)
 
