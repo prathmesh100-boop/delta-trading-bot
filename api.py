@@ -20,6 +20,19 @@ from websockets.exceptions import ConnectionClosed
 
 logger = logging.getLogger(__name__)
 
+RESOLUTION_MAP = {
+    5: "5m",
+    15: "15m",
+    30: "30m",
+    60: "1h",
+    120: "2h",
+    240: "4h",
+    360: "6h",
+    720: "12h",
+    1440: "1d",
+    10080: "1w",
+}
+
 # ─── Enums ────────────────────────────────────────────────────────────────────
 
 class OrderSide(str, Enum):
@@ -280,15 +293,16 @@ class DeltaRESTClient:
     async def get_ohlcv(
         self,
         symbol:     str,
-        resolution: int,
+        resolution: int | str,
         start_time: int,
         end_time:   int,
     ) -> List[OHLCV]:
+        resolution_value = self._normalize_resolution(resolution)
         resp = await self._request(
             "GET", "/v2/history/candles",
             params={
                 "symbol":     symbol,
-                "resolution": resolution,
+                "resolution": resolution_value,
                 "start":      start_time,
                 "end":        end_time,
             },
@@ -305,6 +319,19 @@ class DeltaRESTClient:
                 volume    = float(c.get("volume", 0)),
             ))
         return sorted(candles, key=lambda x: x.timestamp)
+
+    def _normalize_resolution(self, resolution: int | str) -> str:
+        if isinstance(resolution, str):
+            value = resolution.strip().lower()
+            if value:
+                return value
+        mapped = RESOLUTION_MAP.get(int(resolution))
+        if mapped:
+            return mapped
+        raise ValueError(
+            f"Unsupported resolution '{resolution}'. Use one of: "
+            + ", ".join(str(k) for k in sorted(RESOLUTION_MAP))
+        )
 
     async def get_orderbook(self, symbol: str, depth: int = 10) -> L2OrderBook:
         resp = await self._request(
