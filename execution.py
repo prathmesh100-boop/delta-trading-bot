@@ -338,6 +338,38 @@ class ExecutionEngine:
         now = time.time()
         return int((math.floor(now / resolution_seconds) - 1) * resolution_seconds)
 
+    def _log_signal_decision(self, signal: Optional[Signal], price: float, candle_ts: int) -> None:
+        ts = datetime.fromtimestamp(candle_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+        if signal is None or signal.type == SignalType.NEUTRAL:
+            meta = signal.metadata if signal else {}
+            logger.info(
+                "HOLD | %s | %s | price=%.4f | regime=%s | htf=%s | rsi=%s | conf=%.2f",
+                self.symbol,
+                ts,
+                price,
+                meta.get("regime", "-"),
+                meta.get("htf", "-"),
+                meta.get("rsi", "-"),
+                float(signal.confidence) if signal else 0.0,
+            )
+            return
+
+        side = "BUY" if signal.type == SignalType.LONG else "SELL"
+        meta = signal.metadata or {}
+        logger.info(
+            "%s | %s | %s | price=%.4f | sl=%.4f | tp=%s | conf=%.2f | regime=%s | htf=%s | rsi=%s",
+            side,
+            self.symbol,
+            ts,
+            price,
+            float(signal.stop_loss or 0.0),
+            f"{float(signal.take_profit):.4f}" if signal.take_profit else "NONE",
+            float(signal.confidence),
+            meta.get("regime", "-"),
+            meta.get("htf", "-"),
+            meta.get("rsi", "-"),
+        )
+
     async def _tick(self):
         """One strategy tick: fetch candle, generate signal, execute if valid."""
         # Fetch latest candle
@@ -384,13 +416,12 @@ class ExecutionEngine:
             logger.error("Strategy error: %s", exc, exc_info=True)
             return
 
+        price = self._ws_price or float(df["close"].iloc[-1])
+        self._log_signal_decision(signal, price, closed_candle_ts)
+
         if signal is None or signal.type == SignalType.NEUTRAL:
             self._last_signal_candle_ts = closed_candle_ts
-            logger.debug("Neutral signal — no action")
             return
-
-        # Current price
-        price = self._ws_price or float(df["close"].iloc[-1])
 
         # Risk checks
         if not self.risk.check_signal(signal):
