@@ -413,6 +413,13 @@ class DeltaRESTClient:
         except DeltaAPIError:
             return None
 
+    async def get_order_by_client_order_id(self, client_order_id: str) -> Optional[Dict]:
+        try:
+            resp = await self._request("GET", f"/v2/orders/client_order_id/{client_order_id}")
+            return resp.get("result")
+        except DeltaAPIError:
+            return None
+
     async def cancel_all_orders(self, product_id: int) -> bool:
         try:
             await self._request("DELETE", "/v2/orders/all",
@@ -587,10 +594,16 @@ class DeltaWSClient:
             "payload": {"channels": [{"name": channel, "symbols": symbols}]},
         })
 
-    def subscribe_private(self, channels: List[str]):
+    def subscribe_private(self, channels: List[str], symbols: Optional[List[str]] = None):
+        channel_payloads = []
+        for ch in channels:
+            payload = {"name": ch}
+            if symbols and ch == "orders":
+                payload["symbols"] = symbols
+            channel_payloads.append(payload)
         self._subs.append({
             "type": "subscribe",
-            "payload": {"channels": [{"name": ch} for ch in channels]},
+            "payload": {"channels": channel_payloads},
         })
 
     async def _dispatch(self, msg: Dict):

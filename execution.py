@@ -33,6 +33,7 @@ from api import (
     OrderType,
 )
 from risk import RiskManager, TradeRecord
+from state_store import StateStore
 from strategy import ConfluenceStrategy, Signal, SignalType
 
 logger = logging.getLogger(__name__)
@@ -93,6 +94,7 @@ class ExecutionEngine:
         self._last_entry_ts: float = 0.0
         self._lot_size:   float = 0.0
         self._last_signal_candle_ts: int = 0
+        self._state_store = StateStore()
 
     # ── Startup ──────────────────────────────────────────────────────────────
 
@@ -119,11 +121,15 @@ class ExecutionEngine:
         except Exception as exc:
             logger.warning("Could not prime candle buffer: %s", exc)
 
+        await self._recover_trade_state()
+
         # Close any orphaned positions
         try:
             positions = await self.rest.get_positions()
             for pos in positions:
                 if pos.symbol == self.symbol and pos.size > 0:
+                    if self._current_trade and not self._current_trade.closed:
+                        continue
                     logger.warning("⚠️ ORPHANED POSITION: %s %s %.4f @ %.4f — closing!",
                                    pos.symbol, pos.side, pos.size, pos.entry_price)
                     await self._force_close(pos)
@@ -173,7 +179,7 @@ class ExecutionEngine:
         ws = DeltaWSClient(self.api_key, self.api_secret, self._handle_ws)
         ws.subscribe_public("v2/ticker",    [self.symbol])
         ws.subscribe_public("l2_orderbook", [self.symbol])
-        ws.subscribe_private(["orders", "positions", "user_trades"])
+        ws.subscribe_private(["orders", "positions", "user_trades"], symbols=[self.symbol])
 
         ws_task     = asyncio.create_task(ws.connect())
         signal_task = asyncio.create_task(self._signal_loop())
@@ -249,6 +255,8 @@ class ExecutionEngine:
         new_sl = self.risk.update_trailing_stop(trade, price)
         # Note: we update in-memory only. Exchange bracket SL is primary.
         # Could call edit_bracket_order here if Delta supports it.
+        if new_sl is not None:
+            self._persist_trade_state()
 
     async def _handle_private_event(self, msg: Dict):
         """Handle private fills/orders to sync trade state."""
@@ -256,15 +264,18 @@ class ExecutionEngine:
         if not trade:
             return
 
+        msg_type = msg.get("type", "")
         payload = msg.get("result") if isinstance(msg.get("result"), dict) else msg
         order_id = str(payload.get("id") or payload.get("order_id") or "")
         client_order_id = str(payload.get("client_order_id") or "")
         state = msg.get("state") or msg.get("order_state", "")
-        reason = msg.get("close_reason", "")
+        reason = msg.get("close_reason", "") or msg.get("reason", "")
         state = str(state or payload.get("state") or payload.get("order_state") or "").lower()
         reason = str(reason or payload.get("close_reason") or "").lower()
         avg_fill_price = float(payload.get("average_fill_price", 0) or 0)
-        filled_size = int(float(payload.get("filled_size", 0) or payload.get("size", 0) or 0))
+        raw_size = int(float(payload.get("size", 0) or 0))
+        unfilled_size = int(float(payload.get("unfilled_size", 0) or 0))
+        filled_size = int(float(payload.get("filled_size", 0) or max(0, raw_size - unfilled_size)))
 
         is_entry_event = order_id == trade.order_id or (client_order_id and client_order_id == trade.entry_client_order_id)
         if is_entry_event:
@@ -279,14 +290,25 @@ class ExecutionEngine:
             if state in ("cancelled", "rejected") and not trade.entry_filled:
                 logger.warning("Entry order %s %s; releasing local trade state", trade.order_id, state)
                 self.risk.release_trade(trade, reason=state)
+                self._state_store.clear_trade(self.symbol)
                 self._current_trade = None
                 return
+            self._persist_trade_state()
+
+        if msg_type == "positions":
+            symbol = str(payload.get("product_symbol") or payload.get("symbol") or "")
+            if symbol == self.symbol:
+                size = abs(float(payload.get("size", 0) or 0))
+                if size == 0 and trade.entry_filled and not trade.closed:
+                    exit_p = self._ws_price or self._ws_mark or trade.entry_price
+                    await self._mark_closed(trade, exit_p, "position_flattened")
+                    return
 
         is_exit_event = order_id in {trade.stop_order_id, trade.take_profit_order_id}
-        if state in ("closed", "filled") and reason in ("sl_trigger", "tp_trigger") and (is_exit_event or is_entry_event):
+        if state in ("closed", "filled") and reason in ("sl_trigger", "tp_trigger", "stop_trigger") and (is_exit_event or is_entry_event):
             if trade and not trade.closed:
                 exit_p = avg_fill_price or self._ws_price or trade.entry_price
-                close_reason = "stop_loss_exchange" if "sl" in reason else "take_profit_exchange"
+                close_reason = "stop_loss_exchange" if trade.stop_order_id == order_id or "sl" in reason else "take_profit_exchange"
                 logger.info("📩 Exchange %s: %s @ %.4f", close_reason, self.symbol, exit_p)
                 await self._mark_closed(trade, exit_p, close_reason)
 
@@ -493,6 +515,7 @@ class ExecutionEngine:
         self._current_trade = trade
         self.risk.register_trade(trade)
         self._last_entry_ts = time.time()
+        self._persist_trade_state()
 
         # Log to CSV
         _log_csv({
@@ -558,6 +581,7 @@ class ExecutionEngine:
         pnl = trade.net_pnl or 0.0
 
         self.risk.close_trade(trade, exit_price)
+        self._state_store.clear_trade(self.symbol)
         self._current_trade = None
 
         pnl_emoji = "✅" if pnl >= 0 else "❌"
@@ -592,6 +616,89 @@ class ExecutionEngine:
             send_exit_alert(trade.symbol, trade.side, trade.entry_price, exit_price, pnl, reason)
         except Exception:
             pass
+
+    def _persist_trade_state(self):
+        if self._current_trade and not self._current_trade.closed:
+            self._state_store.save_trade(self._current_trade)
+
+    async def _recover_trade_state(self):
+        persisted = self._state_store.load_trade(self.symbol)
+        if not persisted:
+            return
+
+        logger.info("Recovering persisted trade state for %s", self.symbol)
+        recovered = await self._reconcile_trade_with_exchange(persisted)
+        if recovered and not recovered.closed:
+            self._current_trade = recovered
+            self.risk.register_trade(recovered)
+            self._persist_trade_state()
+            logger.info(
+                "Recovered live trade: %s %s %d lots @ %.4f",
+                recovered.symbol,
+                recovered.side.upper(),
+                recovered.filled_size,
+                recovered.entry_price,
+            )
+        else:
+            self._state_store.clear_trade(self.symbol)
+
+    async def _reconcile_trade_with_exchange(self, trade: TradeRecord) -> Optional[TradeRecord]:
+        entry_order = await self._fetch_best_order_snapshot(trade.order_id, trade.entry_client_order_id)
+        stop_order = await self._fetch_best_order_snapshot(trade.stop_order_id)
+        tp_order = await self._fetch_best_order_snapshot(trade.take_profit_order_id)
+        positions = await self.rest.get_positions()
+        position = next((p for p in positions if p.symbol == self.symbol and p.size > 0), None)
+
+        if entry_order:
+            avg_fill_price = float(entry_order.get("average_fill_price", 0) or 0)
+            raw_size = int(float(entry_order.get("size", 0) or trade.size))
+            unfilled_size = int(float(entry_order.get("unfilled_size", 0) or 0))
+            filled_size = max(0, raw_size - unfilled_size)
+            if avg_fill_price > 0:
+                trade.entry_price = avg_fill_price
+                trade.peak_price = avg_fill_price
+                trade.valley_price = avg_fill_price
+            if filled_size > 0:
+                trade.filled_size = filled_size
+                trade.entry_filled = True
+
+        if position:
+            trade.entry_filled = True
+            trade.side = position.side
+            trade.filled_size = max(1, int(abs(position.size)))
+            if position.entry_price > 0:
+                trade.entry_price = position.entry_price
+            trade.notional_usd = trade.filled_size * trade.contract_value * trade.entry_price
+            trade.stop_order_id = str((stop_order or {}).get("id") or trade.stop_order_id or "")
+            trade.take_profit_order_id = str((tp_order or {}).get("id") or trade.take_profit_order_id or "")
+            return trade
+
+        exit_order = None
+        if stop_order and str(stop_order.get("state", "")).lower() in ("closed", "filled"):
+            exit_order = stop_order
+        elif tp_order and str(tp_order.get("state", "")).lower() in ("closed", "filled"):
+            exit_order = tp_order
+        elif entry_order and str(entry_order.get("state", "")).lower() in ("cancelled", "rejected", "closed") and not trade.entry_filled:
+            return None
+
+        if exit_order:
+            exit_price = float(exit_order.get("average_fill_price", 0) or trade.entry_price)
+            trade.closed = True
+            trade.exit_price = exit_price
+            trade.exit_time = datetime.now(timezone.utc)
+            trade.reason = "recovered_closed"
+            return trade
+
+        return None if not trade.entry_filled else trade
+
+    async def _fetch_best_order_snapshot(self, order_id: Optional[str], client_order_id: str = "") -> Optional[Dict]:
+        if order_id:
+            order = await self.rest.get_order_by_id(str(order_id))
+            if order:
+                return order
+        if client_order_id:
+            return await self.rest.get_order_by_client_order_id(client_order_id)
+        return None
 
 
 __all__ = ["ExecutionEngine"]
