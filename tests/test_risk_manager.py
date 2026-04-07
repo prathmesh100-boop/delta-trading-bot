@@ -28,3 +28,20 @@ def test_check_signal_halts_and_limits():
     # With large drawdown/daily loss, trading should be halted or limited
     assert allowed is False
 
+
+def test_trade_record_net_pnl_uses_contract_value():
+    trade = TradeRecord(
+        id="1",
+        symbol="ETH_USDT",
+        side="long",
+        entry_price=100.0,
+        size=10,
+        contract_value=0.01,
+        stop_loss=95.0,
+        take_profit=110.0,
+        entry_time=datetime.utcnow(),
+        order_id="abc",
+    )
+    trade.exit_price = 110.0
+    assert trade.net_pnl == 1.0
+

@@ -60,10 +60,17 @@ class TradeRecord:
     side:        str           # "long" | "short"
     entry_price: float
     size:        int           # lots (integer)
+    contract_value: float
     stop_loss:   float
     take_profit: Optional[float]
     entry_time:  datetime
     order_id:    str
+    entry_client_order_id: str = ""
+    notional_usd: float = 0.0
+    entry_filled: bool = False
+    filled_size: int = 0
+    stop_order_id: Optional[str] = None
+    take_profit_order_id: Optional[str] = None
 
     peak_price:   float = 0.0
     valley_price: float = 0.0
@@ -78,13 +85,17 @@ class TradeRecord:
             self.peak_price = self.entry_price
         if self.valley_price == 0.0:
             self.valley_price = self.entry_price
+        if self.filled_size == 0:
+            self.filled_size = self.size
+        if self.notional_usd == 0.0 and self.contract_value > 0:
+            self.notional_usd = self.size * self.contract_value * self.entry_price
 
     @property
     def net_pnl(self) -> Optional[float]:
         if self.exit_price is None:
             return None
         mult = 1 if self.side == "long" else -1
-        return mult * (self.exit_price - self.entry_price) / self.entry_price * self.size * self.entry_price
+        return mult * (self.exit_price - self.entry_price) * self.filled_size * self.contract_value
 
     @property
     def unrealized_pnl_pct(self) -> Optional[float]:
@@ -236,6 +247,11 @@ class RiskManager:
                     trade.symbol, trade.side.upper(), trade.entry_price,
                     trade.stop_loss,
                     f"{trade.take_profit:.4f}" if trade.take_profit else "NONE")
+
+    def release_trade(self, trade: TradeRecord, reason: str = "released"):
+        if trade in self._open_trades:
+            self._open_trades.remove(trade)
+            logger.warning("Trade released without PnL booking: %s (%s)", trade.symbol, reason)
 
     def close_trade(self, trade: TradeRecord, exit_price: float):
         if trade in self._open_trades:

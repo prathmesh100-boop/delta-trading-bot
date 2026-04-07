@@ -102,6 +102,9 @@ class BracketOrderResult:
     tp_order_id:    Optional[str]
     entry_side:     str
     size:           int
+    average_fill_price: Optional[float] = None
+    filled_size:    int = 0
+    state:          str = ""
     raw:            Dict = field(default_factory=dict)
 
 # ─── Exceptions ───────────────────────────────────────────────────────────────
@@ -333,6 +336,47 @@ class DeltaRESTClient:
                 return float(b.get("available_balance", 0))
         return 0.0
 
+    async def get_account_equity(self, asset: str = "USDT") -> float:
+        """
+        Best-effort account equity.
+        Prefer exchange-reported equity fields; otherwise approximate with
+        available balance + margin in use + unrealized PnL.
+        """
+        resp = await self._request("GET", "/v2/wallet/balances")
+        balances = resp.get("result", [])
+        equity = 0.0
+        available = 0.0
+
+        for b in balances:
+            if b.get("asset_symbol") != asset:
+                continue
+            for field in ("equity", "total_balance", "wallet_balance", "balance"):
+                raw = b.get(field)
+                if raw is not None:
+                    try:
+                        equity = float(raw)
+                        break
+                    except (TypeError, ValueError):
+                        continue
+            try:
+                available = float(b.get("available_balance", 0) or 0)
+            except (TypeError, ValueError):
+                available = 0.0
+            break
+
+        if equity > 0:
+            return equity
+
+        try:
+            positions = await self.get_positions()
+        except Exception:
+            positions = []
+
+        margin_in_use = sum(max(0.0, float(p.margin)) for p in positions)
+        unrealized = sum(float(p.unrealized_pnl) for p in positions)
+        approx_equity = available + margin_in_use + unrealized
+        return approx_equity if approx_equity > 0 else available
+
     async def get_positions(self) -> List[Position]:
         resp = await self._request("GET", "/v2/positions/margined")
         positions = []
@@ -452,6 +496,9 @@ class DeltaRESTClient:
             tp_order_id    = tp_id or None,
             entry_side     = side.value,
             size           = size,
+            average_fill_price = float(result.get("average_fill_price", 0) or 0) or None,
+            filled_size    = int(float(result.get("filled_size", 0) or 0)),
+            state          = str(result.get("state", "") or result.get("order_state", "")),
             raw            = result,
         )
 

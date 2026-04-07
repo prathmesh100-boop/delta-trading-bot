@@ -14,6 +14,7 @@ Architecture:
 import asyncio
 import csv
 import logging
+import math
 import os
 import time
 import uuid
@@ -91,6 +92,7 @@ class ExecutionEngine:
         self._shutdown    = False
         self._last_entry_ts: float = 0.0
         self._lot_size:   float = 0.0
+        self._last_signal_candle_ts: int = 0
 
     # ── Startup ──────────────────────────────────────────────────────────────
 
@@ -130,10 +132,10 @@ class ExecutionEngine:
 
         # Fetch balance and update equity
         try:
-            balance = await self.rest.get_wallet_balance("USDT")
-            if balance > 0:
-                self.risk.update_equity(balance)
-                logger.info("💰 Wallet balance: %.4f USDT", balance)
+            equity = await self.rest.get_account_equity("USDT")
+            if equity > 0:
+                self.risk.update_equity(equity)
+                logger.info("💰 Account equity: %.4f USDT", equity)
         except Exception as exc:
             logger.warning("Balance fetch failed: %s", exc)
 
@@ -250,12 +252,40 @@ class ExecutionEngine:
 
     async def _handle_private_event(self, msg: Dict):
         """Handle private fills/orders to sync trade state."""
+        trade = self._current_trade
+        if not trade:
+            return
+
+        payload = msg.get("result") if isinstance(msg.get("result"), dict) else msg
+        order_id = str(payload.get("id") or payload.get("order_id") or "")
+        client_order_id = str(payload.get("client_order_id") or "")
         state = msg.get("state") or msg.get("order_state", "")
         reason = msg.get("close_reason", "")
-        if state in ("closed", "filled") and reason in ("sl_trigger", "tp_trigger"):
-            trade = self._current_trade
+        state = str(state or payload.get("state") or payload.get("order_state") or "").lower()
+        reason = str(reason or payload.get("close_reason") or "").lower()
+        avg_fill_price = float(payload.get("average_fill_price", 0) or 0)
+        filled_size = int(float(payload.get("filled_size", 0) or payload.get("size", 0) or 0))
+
+        is_entry_event = order_id == trade.order_id or (client_order_id and client_order_id == trade.entry_client_order_id)
+        if is_entry_event:
+            if avg_fill_price > 0:
+                trade.entry_price = avg_fill_price
+                trade.peak_price = avg_fill_price
+                trade.valley_price = avg_fill_price
+            if filled_size > 0:
+                trade.filled_size = filled_size
+            if state in ("filled", "closed", "partially_filled", "partially_closed"):
+                trade.entry_filled = trade.filled_size > 0
+            if state in ("cancelled", "rejected") and not trade.entry_filled:
+                logger.warning("Entry order %s %s; releasing local trade state", trade.order_id, state)
+                self.risk.release_trade(trade, reason=state)
+                self._current_trade = None
+                return
+
+        is_exit_event = order_id in {trade.stop_order_id, trade.take_profit_order_id}
+        if state in ("closed", "filled") and reason in ("sl_trigger", "tp_trigger") and (is_exit_event or is_entry_event):
             if trade and not trade.closed:
-                exit_p = float(msg.get("average_fill_price", self._ws_price) or self._ws_price)
+                exit_p = avg_fill_price or self._ws_price or trade.entry_price
                 close_reason = "stop_loss_exchange" if "sl" in reason else "take_profit_exchange"
                 logger.info("📩 Exchange %s: %s @ %.4f", close_reason, self.symbol, exit_p)
                 await self._mark_closed(trade, exit_p, close_reason)
@@ -273,13 +303,28 @@ class ExecutionEngine:
                 await self._tick()
             except Exception as exc:
                 logger.error("Signal tick error: %s", exc, exc_info=True)
-            await asyncio.sleep(self.resolution * 60)
+            await asyncio.sleep(self._seconds_until_next_close())
+
+    def _seconds_until_next_close(self, buffer_seconds: int = 2) -> float:
+        resolution_seconds = self.resolution * 60
+        now = time.time()
+        next_close = (math.floor(now / resolution_seconds) + 1) * resolution_seconds
+        return max(1.0, next_close - now + buffer_seconds)
+
+    def _latest_closed_candle_ts(self) -> int:
+        resolution_seconds = self.resolution * 60
+        now = time.time()
+        return int((math.floor(now / resolution_seconds) - 1) * resolution_seconds)
 
     async def _tick(self):
         """One strategy tick: fetch candle, generate signal, execute if valid."""
         # Fetch latest candle
-        end   = int(time.time())
-        start = end - self.resolution * 60 * 5  # last 5 bars
+        closed_candle_ts = self._latest_closed_candle_ts()
+        if closed_candle_ts <= self._last_signal_candle_ts:
+            return
+
+        end = closed_candle_ts
+        start = end - self.resolution * 60 * 6
         try:
             new_candles = await self.rest.get_ohlcv(self.symbol, self.resolution, start, end)
             for c in new_candles:
@@ -305,6 +350,7 @@ class ExecutionEngine:
         df = pd.DataFrame(self._candle_buf).set_index("timestamp")
         df.index = pd.to_datetime(df.index, unit="s", utc=True)
         df = df[["open", "high", "low", "close", "volume"]].astype(float)
+        df = df[df.index <= pd.to_datetime(closed_candle_ts, unit="s", utc=True)]
 
         # Update equity from balance periodically
         # (also done in _balance_loop, this is a secondary update)
@@ -317,6 +363,7 @@ class ExecutionEngine:
             return
 
         if signal is None or signal.type == SignalType.NEUTRAL:
+            self._last_signal_candle_ts = closed_candle_ts
             logger.debug("Neutral signal — no action")
             return
 
@@ -325,31 +372,37 @@ class ExecutionEngine:
 
         # Risk checks
         if not self.risk.check_signal(signal):
+            self._last_signal_candle_ts = closed_candle_ts
             logger.info("Signal rejected by risk manager")
             return
 
         # Cooldown check
         time_since_last = time.time() - self._last_entry_ts
         if time_since_last < self.cooldown_seconds:
+            self._last_signal_candle_ts = closed_candle_ts
             logger.info("Cooldown: %.0fs remaining", self.cooldown_seconds - time_since_last)
             return
 
         # Trade already open?
         if self._current_trade and not self._current_trade.closed:
+            self._last_signal_candle_ts = closed_candle_ts
             logger.debug("Trade already open — skipping new entry")
             return
 
         # Confidence filter
         if signal.confidence < self.min_confidence:
+            self._last_signal_candle_ts = closed_candle_ts
             logger.info("Confidence %.2f < %.2f — skipping", signal.confidence, self.min_confidence)
             return
 
         # Validate SL/TP exist and make sense
         if not signal.stop_loss or signal.stop_loss <= 0:
+            self._last_signal_candle_ts = closed_candle_ts
             logger.warning("Signal has no valid SL — skipping")
             return
 
         await self._execute_entry(signal, price, df)
+        self._last_signal_candle_ts = closed_candle_ts
 
     # ── Balance Loop ──────────────────────────────────────────────────────────
 
@@ -358,9 +411,9 @@ class ExecutionEngine:
         while not self._shutdown:
             await asyncio.sleep(300)
             try:
-                balance = await self.rest.get_wallet_balance("USDT")
-                if balance > 0:
-                    self.risk.update_equity(balance)
+                equity = await self.rest.get_account_equity("USDT")
+                if equity > 0:
+                    self.risk.update_equity(equity)
             except Exception as exc:
                 logger.debug("Balance refresh failed: %s", exc)
             # Also refresh funding rate
@@ -423,12 +476,19 @@ class ExecutionEngine:
             id          = str(uuid.uuid4()),
             symbol      = self.symbol,
             side        = "long" if signal.type == SignalType.LONG else "short",
-            entry_price = price,
+            entry_price = result.average_fill_price or price,
             size        = lots,
+            contract_value = self._lot_size,
             stop_loss   = signal.stop_loss,
             take_profit = signal.take_profit,
             entry_time  = datetime.now(timezone.utc),
             order_id    = result.entry_order_id,
+            entry_client_order_id = coid,
+            notional_usd = lots * self._lot_size * (result.average_fill_price or price),
+            entry_filled = bool(result.average_fill_price or result.filled_size or result.state in ("filled", "closed")),
+            filled_size = result.filled_size or lots,
+            stop_order_id = result.sl_order_id,
+            take_profit_order_id = result.tp_order_id,
         )
         self._current_trade = trade
         self.risk.register_trade(trade)
@@ -440,10 +500,12 @@ class ExecutionEngine:
             "symbol": self.symbol,
             "event": "ENTRY",
             "side": trade.side,
-            "price": price,
+            "price": trade.entry_price,
             "stop_loss": signal.stop_loss,
             "take_profit": signal.take_profit,
             "lots": lots,
+            "contract_value": self._lot_size,
+            "notional_usd": round(trade.notional_usd, 4),
             "confidence": signal.confidence,
             "regime": signal.metadata.get("regime", ""),
             "htf": signal.metadata.get("htf", ""),
@@ -454,7 +516,7 @@ class ExecutionEngine:
             from notifier import send_trade_alert
             send_trade_alert({
                 "symbol": self.symbol, "side": trade.side,
-                "entry_price": price, "stop_loss": signal.stop_loss,
+                "entry_price": trade.entry_price, "stop_loss": signal.stop_loss,
                 "take_profit": signal.take_profit, "size": lots,
             })
         except Exception:
@@ -493,8 +555,7 @@ class ExecutionEngine:
         trade.exit_time  = datetime.now(timezone.utc)
         trade.reason     = reason
 
-        pnl_mult = 1 if trade.side == "long" else -1
-        pnl = pnl_mult * (exit_price - trade.entry_price) / trade.entry_price * trade.size * trade.entry_price
+        pnl = trade.net_pnl or 0.0
 
         self.risk.close_trade(trade, exit_price)
         self._current_trade = None
