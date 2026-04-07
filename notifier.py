@@ -73,3 +73,7 @@ def send_exit_alert(symbol, side, entry_price, exit_price, pnl, reason) -> None:
 
 def send_status(msg: str) -> None:
     send(f"ℹ️ BOT STATUS\n\n{msg}")
+
+
+def send_telegram(msg: str) -> None:
+    send(msg)
