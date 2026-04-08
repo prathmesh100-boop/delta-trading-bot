@@ -199,10 +199,13 @@ class ConfluenceStrategy:
         self.atr_period     = p.get("atr_period", 14)
         self.adx_threshold  = p.get("adx_threshold", 20.0)
         self.vol_factor     = p.get("vol_factor", 1.2)
-        self.rsi_long_min   = p.get("rsi_long_min", 35)
-        self.rsi_long_max   = p.get("rsi_long_max", 60)
-        self.rsi_short_min  = p.get("rsi_short_min", 40)
-        self.rsi_short_max  = p.get("rsi_short_max", 65)
+        self.rsi_long_min   = p.get("rsi_long_min", 30)
+        self.rsi_long_max   = p.get("rsi_long_max", 70)
+        self.rsi_short_min  = p.get("rsi_short_min", 30)
+        self.rsi_short_max  = p.get("rsi_short_max", 70)
+        self.max_ema_distance_pct = p.get("max_ema_distance_pct", 0.03)
+        self.funding_long_max = p.get("funding_long_max", 0.02)
+        self.funding_short_min = p.get("funding_short_min", -0.02)
         # RR
         self.sl_atr_mult    = p.get("sl_atr_mult", 1.5)
         self.tp_rr          = p.get("tp_rr", 2.5)
@@ -214,7 +217,7 @@ class ConfluenceStrategy:
 
     def generate_signal(self, df: pd.DataFrame, symbol: str = "", funding_rate: float = 0.0) -> Optional[Signal]:
         if len(df) < 210:
-            return Signal(SignalType.NEUTRAL)
+            return Signal(SignalType.NEUTRAL, confidence=0.0)
 
         close   = df["close"]
         price   = float(close.iloc[-1])
@@ -257,8 +260,8 @@ class ConfluenceStrategy:
         vol_ok    = curr_vol > curr_avg_v * self.vol_factor if curr_avg_v > 0 else False
 
         # Funding rate guard (extreme funding = crowded trade = fade it)
-        funding_extreme_long  = funding_rate >  0.001  # > 0.1% per 8h
-        funding_extreme_short = funding_rate < -0.001  # < -0.1%
+        funding_extreme_long  = funding_rate > self.funding_long_max
+        funding_extreme_short = funding_rate < self.funding_short_min
 
         # ── Find last swing high/low for SL placement ─────────────────────────
         last_swing_low  = self._last_swing_low(df, self.swing_lookback)
@@ -336,11 +339,11 @@ class ConfluenceStrategy:
 
         # ── LONG CONDITIONS ───────────────────────────────────────────────────
         cond_long = (
-            htf == "bull"                               # Macro uptrend
+            htf != "bear"                               # Allow neutral if local trend confirms
             and price > ema50                           # Price above trend EMA
             and ema50 > ema200                          # Golden cross condition
             and price > ema21                           # Price above mid EMA (pullback ended)
-            and abs(price - ema21) / ema21 < 0.015     # Close to EMA21 (pullback entry)
+            and abs(price - ema21) / ema21 < self.max_ema_distance_pct
             and self.rsi_long_min < curr_rsi < self.rsi_long_max  # RSI in valid zone
             and macd_h > prev_macd_h                   # MACD histogram rising (momentum)
             and curr_adx > self.adx_threshold           # Trend is strong
@@ -349,16 +352,14 @@ class ConfluenceStrategy:
             and (not funding_extreme_long)             # Not crowded long
             and last_swing_low is not None             # Have reference for SL
         )
-        # require order-flow trigger for trend entries (optional gating)
-        cond_long = cond_long and entry_trigger_long
 
         # ── SHORT CONDITIONS ──────────────────────────────────────────────────
         cond_short = (
-            htf == "bear"                               # Macro downtrend
+            htf != "bull"                               # Allow neutral if local trend confirms
             and price < ema50                           # Price below trend EMA
             and ema50 < ema200                          # Death cross condition
             and price < ema21                           # Price below mid EMA
-            and abs(price - ema21) / ema21 < 0.015     # Close to EMA21 (pullback ended)
+            and abs(price - ema21) / ema21 < self.max_ema_distance_pct
             and self.rsi_short_min < curr_rsi < self.rsi_short_max
             and macd_h < prev_macd_h                   # MACD histogram falling
             and curr_adx > self.adx_threshold
@@ -367,7 +368,6 @@ class ConfluenceStrategy:
             and (not funding_extreme_short)
             and last_swing_high is not None
         )
-        cond_short = cond_short and entry_trigger_short
 
         if cond_long:
             sl  = last_swing_low - curr_atr * self.sl_atr_mult
@@ -377,6 +377,7 @@ class ConfluenceStrategy:
             tp  = price + risk * self.tp_rr
 
             confidence = self._calc_confidence_long(curr_rsi, curr_adx, plus_di, minus_di, macd_h, vol_ok)
+            confidence = min(1.0, confidence + self._trigger_bonus(entry_trigger_long, sweep_long, reclaim_long, bos_long))
             logger.info("✅ LONG SIGNAL | price=%.4f | sl=%.4f | tp=%.4f | conf=%.2f | adx=%.1f | rsi=%.1f",
                        price, sl, tp, confidence, curr_adx, curr_rsi)
             return Signal(
@@ -387,10 +388,11 @@ class ConfluenceStrategy:
                 take_profit= round(tp, 4),
                 confidence = confidence,
                 metadata   = {
-                    "regime": "trend", "htf": "bull",
+                    "regime": "trend", "htf": htf,
                     "ema21": round(ema21, 4), "adx": round(curr_adx, 1),
                     "rsi": round(curr_rsi, 1), "macd_hist": round(macd_h, 6),
                     "last_swing_low": round(last_swing_low, 4),
+                    "entry_trigger": entry_trigger_long,
                 },
             )
 
@@ -402,6 +404,7 @@ class ConfluenceStrategy:
             tp  = price - risk * self.tp_rr
 
             confidence = self._calc_confidence_short(curr_rsi, curr_adx, plus_di, minus_di, macd_h, vol_ok)
+            confidence = min(1.0, confidence + self._trigger_bonus(entry_trigger_short, sweep_short, reclaim_short, bos_short))
             logger.info("✅ SHORT SIGNAL | price=%.4f | sl=%.4f | tp=%.4f | conf=%.2f | adx=%.1f | rsi=%.1f",
                        price, sl, tp, confidence, curr_adx, curr_rsi)
             return Signal(
@@ -412,14 +415,15 @@ class ConfluenceStrategy:
                 take_profit= round(tp, 4),
                 confidence = confidence,
                 metadata   = {
-                    "regime": "trend", "htf": "bear",
+                    "regime": "trend", "htf": htf,
                     "ema21": round(ema21, 4), "adx": round(curr_adx, 1),
                     "rsi": round(curr_rsi, 1), "macd_hist": round(macd_h, 6),
                     "last_swing_high": round(last_swing_high, 4),
+                    "entry_trigger": entry_trigger_short,
                 },
             )
 
-        return Signal(SignalType.NEUTRAL, metadata={"regime": "trend", "htf": htf, "rsi": round(curr_rsi, 1)})
+        return Signal(SignalType.NEUTRAL, confidence=0.0, metadata={"regime": "trend", "htf": htf, "rsi": round(curr_rsi, 1)})
 
     def _range_signal(
         self,
@@ -435,7 +439,7 @@ class ConfluenceStrategy:
         mid_v = mid.iloc[-1]
 
         if pd.isna(lower) or pd.isna(upper):
-            return Signal(SignalType.NEUTRAL, metadata={"regime": "range"})
+            return Signal(SignalType.NEUTRAL, confidence=0.0, metadata={"regime": "range"})
 
         # Long: price below lower BB, RSI oversold
         if price < lower and curr_rsi < 35 and last_swing_low is not None:
@@ -469,7 +473,7 @@ class ConfluenceStrategy:
                     metadata={"regime": "range", "bb_upper": round(upper, 4), "rsi": round(curr_rsi, 1)},
                 )
 
-        return Signal(SignalType.NEUTRAL, metadata={"regime": "range", "rsi": round(curr_rsi, 1)})
+        return Signal(SignalType.NEUTRAL, confidence=0.0, metadata={"regime": "range", "rsi": round(curr_rsi, 1)})
 
     def _last_swing_low(self, df: pd.DataFrame, lookback: int) -> Optional[float]:
         """Find the most recent significant swing low in the last 50 bars."""
@@ -525,6 +529,18 @@ class ConfluenceStrategy:
         scores.append(0.8 if macd_h < 0 else 0.3)
         scores.append(0.9 if vol_ok else 0.5)
         return round(sum(scores) / len(scores), 3)
+
+    def _trigger_bonus(self, entry_trigger: bool, sweep: bool, reclaim: bool, bos: bool) -> float:
+        if entry_trigger:
+            return 0.20
+        bonus = 0.0
+        if sweep:
+            bonus += 0.05
+        if reclaim:
+            bonus += 0.05
+        if bos:
+            bonus += 0.10
+        return bonus
 
 
 # ─── Strategy Registry ────────────────────────────────────────────────────────
