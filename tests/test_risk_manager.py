@@ -45,3 +45,19 @@ def test_trade_record_net_pnl_uses_contract_value():
     trade.exit_price = 110.0
     assert trade.net_pnl == 1.0
 
+
+def test_update_equity_resets_baseline_on_fresh_session_outlier():
+    cfg = RiskConfig()
+    rm = RiskManager(cfg, initial_capital=50.0)
+
+    rm.update_equity(525.0)
+    assert rm.current_equity == 525.0
+    assert rm._peak_equity == 525.0
+
+    rm.update_equity(50.0)
+
+    assert rm.current_equity == 50.0
+    assert rm.current_capital == 50.0
+    assert rm._peak_equity == 50.0
+    assert rm.can_trade() is True
+

@@ -120,6 +120,24 @@ class RiskManager:
     def update_equity(self, new_equity: float):
         if new_equity <= 0:
             return
+        previous_equity = self.current_equity
+        no_trade_history = not self._open_trades and not self._closed_trades
+        if (
+            no_trade_history
+            and previous_equity > 0
+            and abs(new_equity - previous_equity) / previous_equity >= 0.50
+        ):
+            logger.warning(
+                "Equity baseline reset: prev=%.4f new=%.4f (fresh session, no trade history)",
+                previous_equity, new_equity,
+            )
+            self.current_equity  = new_equity
+            self.current_capital = new_equity
+            self._peak_equity    = new_equity
+            self._daily_start_eq = new_equity
+            self._daily_reset_date = datetime.now(timezone.utc).date()
+            self._circuit_breaker = False
+            return
         self.current_equity  = new_equity
         self.current_capital = new_equity
         if new_equity > self._peak_equity:
@@ -153,6 +171,33 @@ class RiskManager:
                 logger.warning(
                     "🔴 DAILY LOSS HALT: %.2f%% (limit %.2f%%)",
                     daily_loss * 100, self.config.daily_loss_limit_pct * 100,
+                )
+                return False
+
+        return True
+
+    def can_trade(self) -> bool:
+        if self._circuit_breaker:
+            logger.warning("Circuit breaker active - trading halted")
+            return False
+        if self._peak_equity > 0:
+            drawdown = (self._peak_equity - self.current_capital) / self._peak_equity
+            if drawdown >= self.config.max_drawdown_pct:
+                logger.warning(
+                    "MAX DRAWDOWN HALT: %.2f%% (limit %.2f%%) | peak=%.4f current=%.4f",
+                    drawdown * 100, self.config.max_drawdown_pct * 100,
+                    self._peak_equity, self.current_capital,
+                )
+                self._circuit_breaker = True
+                return False
+
+        if self._daily_start_eq > 0:
+            daily_loss = (self._daily_start_eq - self.current_capital) / self._daily_start_eq
+            if daily_loss >= self.config.daily_loss_limit_pct:
+                logger.warning(
+                    "DAILY LOSS HALT: %.2f%% (limit %.2f%%) | start=%.4f current=%.4f",
+                    daily_loss * 100, self.config.daily_loss_limit_pct * 100,
+                    self._daily_start_eq, self.current_capital,
                 )
                 return False
 
