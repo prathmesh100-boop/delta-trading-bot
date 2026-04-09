@@ -52,6 +52,7 @@ class SignalType(str, Enum):
     LONG    = "long"
     SHORT   = "short"
     NEUTRAL = "neutral"
+    HOLD    = "neutral"
 
 
 @dataclass
@@ -139,7 +140,7 @@ def detect_regime(df: pd.DataFrame) -> str:
     adx_val = adx_series.iloc[-1]
     if pd.isna(adx_val):
         return "trend"
-    return "trend" if adx_val > 22 else "range"
+    return "trend" if adx_val >= 18 else "range"
 
 def higher_timeframe_trend(df: pd.DataFrame) -> str:
     """
@@ -197,23 +198,28 @@ class ConfluenceStrategy:
         self.trend_ema      = p.get("trend_ema", 200)
         self.rsi_period     = p.get("rsi_period", 14)
         self.atr_period     = p.get("atr_period", 14)
-        self.adx_threshold  = p.get("adx_threshold", 20.0)
-        self.vol_factor     = p.get("vol_factor", 1.2)
-        self.rsi_long_min   = p.get("rsi_long_min", 30)
-        self.rsi_long_max   = p.get("rsi_long_max", 70)
-        self.rsi_short_min  = p.get("rsi_short_min", 30)
-        self.rsi_short_max  = p.get("rsi_short_max", 70)
-        self.max_ema_distance_pct = p.get("max_ema_distance_pct", 0.03)
+        self.adx_threshold  = p.get("adx_threshold", 16.0)
+        self.vol_factor     = p.get("vol_factor", 1.05)
+        self.rsi_long_min   = p.get("rsi_long_min", 38)
+        self.rsi_long_max   = p.get("rsi_long_max", 68)
+        self.rsi_short_min  = p.get("rsi_short_min", 32)
+        self.rsi_short_max  = p.get("rsi_short_max", 62)
+        self.max_ema_distance_pct = p.get("max_ema_distance_pct", 0.05)
         self.funding_long_max = p.get("funding_long_max", 0.02)
         self.funding_short_min = p.get("funding_short_min", -0.02)
         # RR
-        self.sl_atr_mult    = p.get("sl_atr_mult", 1.5)
-        self.tp_rr          = p.get("tp_rr", 2.5)
+        self.sl_atr_mult    = p.get("sl_atr_mult", 1.2)
+        self.tp_rr          = p.get("tp_rr", 1.8)
         # Swing detection
-        self.swing_lookback = p.get("swing_lookback", 5)
+        self.swing_lookback = p.get("swing_lookback", 4)
         # BB for ranging
         self.bb_period      = p.get("bb_period", 20)
-        self.bb_std         = p.get("bb_std", 2.0)
+        self.bb_std         = p.get("bb_std", 1.6)
+
+    def _neutral_signal(self, regime: str, **metadata: Any) -> Signal:
+        payload = {"regime": regime}
+        payload.update(metadata)
+        return Signal(SignalType.NEUTRAL, confidence=0.0, metadata=payload)
 
     def generate_signal(self, df: pd.DataFrame, symbol: str = "", funding_rate: float = 0.0) -> Optional[Signal]:
         if len(df) < 210:
@@ -250,6 +256,8 @@ class ConfluenceStrategy:
         curr_avg_v  = float(avg_vol.iloc[-1]) if not pd.isna(avg_vol.iloc[-1]) else 0.0
         curr_macd_h = float(macd_hist.iloc[-1])
         prev_macd_h = float(macd_hist.iloc[-2])
+        curr_open   = float(df["open"].iloc[-1])
+        prev_close  = float(close.iloc[-2])
 
         # ── Regime Detection ──────────────────────────────────────────────────
         regime   = detect_regime(df)
@@ -290,13 +298,13 @@ class ConfluenceStrategy:
                 last_swing_low, last_swing_high,
                 funding_extreme_long, funding_extreme_short,
                 prev_swing_low, prev_swing_high, prev_bar,
-                symbol,
+                curr_open, prev_close, symbol,
             )
         else:
             # RANGE REGIME: Bollinger mean reversion
             return self._range_signal(
                 df, price, curr_rsi, curr_atr, vol_ok,
-                last_swing_low, last_swing_high, symbol,
+                last_swing_low, last_swing_high, curr_open, prev_close, symbol,
             )
 
     def _trend_signal(
@@ -309,7 +317,7 @@ class ConfluenceStrategy:
         last_swing_low, last_swing_high,
         funding_extreme_long, funding_extreme_short,
         prev_swing_low, prev_swing_high, prev_bar,
-        symbol,
+        curr_open, prev_close, symbol,
     ) -> Signal:
 
         # ── Liquidity Sweep + Reclaim + BOS (order-flow trigger)
@@ -338,33 +346,43 @@ class ConfluenceStrategy:
         entry_trigger_short = bool(sweep_short and reclaim_short and bos_short)
 
         # ── LONG CONDITIONS ───────────────────────────────────────────────────
+        trend_bull = price > ema50 and ema21 > ema50 and ema50 >= ema200 * 0.997
+        trend_bear = price < ema50 and ema21 < ema50 and ema50 <= ema200 * 1.003
+        pullback_long = price >= ema21 * 0.997 and abs(price - ema21) / ema21 <= self.max_ema_distance_pct
+        pullback_short = price <= ema21 * 1.003 and abs(price - ema21) / ema21 <= self.max_ema_distance_pct
+        long_momentum = macd_h > prev_macd_h or macd_h > 0
+        short_momentum = macd_h < prev_macd_h or macd_h < 0
+        long_reversal = price >= curr_open or price >= prev_close
+        short_reversal = price <= curr_open or price <= prev_close
+        adx_ok = curr_adx >= self.adx_threshold * 0.9
+        long_di_ok = plus_di >= minus_di * 0.95
+        short_di_ok = minus_di >= plus_di * 0.95
+
         cond_long = (
-            htf != "bear"                               # Allow neutral if local trend confirms
-            and price > ema50                           # Price above trend EMA
-            and ema50 > ema200                          # Golden cross condition
-            and price > ema21                           # Price above mid EMA (pullback ended)
-            and abs(price - ema21) / ema21 < self.max_ema_distance_pct
-            and self.rsi_long_min < curr_rsi < self.rsi_long_max  # RSI in valid zone
-            and macd_h > prev_macd_h                   # MACD histogram rising (momentum)
-            and curr_adx > self.adx_threshold           # Trend is strong
-            and plus_di > minus_di                     # Bulls in control
-            and vol_alive                               # Volatility alive
-            and (not funding_extreme_long)             # Not crowded long
-            and last_swing_low is not None             # Have reference for SL
+            htf != "bear"
+            and trend_bull
+            and pullback_long
+            and self.rsi_long_min <= curr_rsi <= self.rsi_long_max
+            and long_momentum
+            and adx_ok
+            and long_di_ok
+            and vol_alive
+            and long_reversal
+            and (not funding_extreme_long)
+            and last_swing_low is not None
         )
 
         # ── SHORT CONDITIONS ──────────────────────────────────────────────────
         cond_short = (
-            htf != "bull"                               # Allow neutral if local trend confirms
-            and price < ema50                           # Price below trend EMA
-            and ema50 < ema200                          # Death cross condition
-            and price < ema21                           # Price below mid EMA
-            and abs(price - ema21) / ema21 < self.max_ema_distance_pct
-            and self.rsi_short_min < curr_rsi < self.rsi_short_max
-            and macd_h < prev_macd_h                   # MACD histogram falling
-            and curr_adx > self.adx_threshold
-            and minus_di > plus_di                     # Bears in control
+            htf != "bull"
+            and trend_bear
+            and pullback_short
+            and self.rsi_short_min <= curr_rsi <= self.rsi_short_max
+            and short_momentum
+            and adx_ok
+            and short_di_ok
             and vol_alive
+            and short_reversal
             and (not funding_extreme_short)
             and last_swing_high is not None
         )
@@ -423,12 +441,25 @@ class ConfluenceStrategy:
                 },
             )
 
-        return Signal(SignalType.NEUTRAL, confidence=0.0, metadata={"regime": "trend", "htf": htf, "rsi": round(curr_rsi, 1)})
+        blockers = []
+        if htf == "bear":
+            blockers.append("htf_bearish")
+        if htf == "bull":
+            blockers.append("htf_bullish")
+        if not trend_bull and not trend_bear:
+            blockers.append("ema_alignment_weak")
+        if not adx_ok:
+            blockers.append("adx_too_low")
+        if not vol_alive:
+            blockers.append("volatility_dead")
+        if not long_momentum and not short_momentum:
+            blockers.append("momentum_flat")
+        return self._neutral_signal("trend", htf=htf, rsi=round(curr_rsi, 1), adx=round(curr_adx, 1), blockers=blockers)
 
     def _range_signal(
         self,
         df, price, curr_rsi, curr_atr, vol_ok,
-        last_swing_low, last_swing_high, symbol,
+        last_swing_low, last_swing_high, curr_open, prev_close, symbol,
     ) -> Signal:
         """Bollinger Band mean reversion for ranging markets."""
         close = df["close"]
@@ -439,41 +470,49 @@ class ConfluenceStrategy:
         mid_v = mid.iloc[-1]
 
         if pd.isna(lower) or pd.isna(upper):
-            return Signal(SignalType.NEUTRAL, confidence=0.0, metadata={"regime": "range"})
+            return self._neutral_signal("range")
 
-        # Long: price below lower BB, RSI oversold
-        if price < lower and curr_rsi < 35 and last_swing_low is not None:
-            sl   = last_swing_low - curr_atr * 0.5
-            sl   = min(sl, price * 0.985)
+        long_reclaim = price >= curr_open or price >= prev_close
+        short_reclaim = price <= curr_open or price <= prev_close
+
+        # Long: price near lower BB, RSI soft oversold, reclaiming
+        if price <= lower * 1.002 and curr_rsi <= 42 and last_swing_low is not None and long_reclaim:
+            sl   = last_swing_low - curr_atr * 0.35
+            sl   = min(sl, price * 0.99)
             risk = price - sl
-            tp   = mid_v  # TP at mid BB
-            if tp > price + risk * 1.5:  # Ensure at least 1.5R
-                confidence = min(1.0, (lower - price) / (curr_atr + 0.0001) * 0.3 + 0.55)
+            tp   = min(float(upper), price + risk * max(1.2, self.tp_rr))
+            if risk > 0 and tp > price + risk * 1.15:
+                confidence = min(1.0, 0.58 + max(0.0, (lower - price) / (curr_atr + 0.0001)) * 0.18 + (0.08 if vol_ok else 0.0))
                 logger.info("✅ RANGE LONG | price=%.4f | sl=%.4f | tp=%.4f | rsi=%.1f", price, sl, tp, curr_rsi)
                 return Signal(
                     type=SignalType.LONG, symbol=symbol, price=price,
                     stop_loss=round(sl, 4), take_profit=round(tp, 4),
                     confidence=confidence,
-                    metadata={"regime": "range", "bb_lower": round(lower, 4), "rsi": round(curr_rsi, 1)},
+                    metadata={"regime": "range", "bb_lower": round(lower, 4), "bb_mid": round(mid_v, 4), "rsi": round(curr_rsi, 1)},
                 )
 
-        # Short: price above upper BB, RSI overbought
-        if price > upper and curr_rsi > 65 and last_swing_high is not None:
-            sl   = last_swing_high + curr_atr * 0.5
-            sl   = max(sl, price * 1.015)
+        # Short: price near upper BB, RSI soft overbought, rolling over
+        if price >= upper * 0.998 and curr_rsi >= 58 and last_swing_high is not None and short_reclaim:
+            sl   = last_swing_high + curr_atr * 0.35
+            sl   = max(sl, price * 1.01)
             risk = sl - price
-            tp   = mid_v
-            if tp < price - risk * 1.5:
-                confidence = min(1.0, (price - upper) / (curr_atr + 0.0001) * 0.3 + 0.55)
+            tp   = max(float(lower), price - risk * max(1.2, self.tp_rr))
+            if risk > 0 and tp < price - risk * 1.15:
+                confidence = min(1.0, 0.58 + max(0.0, (price - upper) / (curr_atr + 0.0001)) * 0.18 + (0.08 if vol_ok else 0.0))
                 logger.info("✅ RANGE SHORT | price=%.4f | sl=%.4f | tp=%.4f | rsi=%.1f", price, sl, tp, curr_rsi)
                 return Signal(
                     type=SignalType.SHORT, symbol=symbol, price=price,
                     stop_loss=round(sl, 4), take_profit=round(tp, 4),
                     confidence=confidence,
-                    metadata={"regime": "range", "bb_upper": round(upper, 4), "rsi": round(curr_rsi, 1)},
+                    metadata={"regime": "range", "bb_upper": round(upper, 4), "bb_mid": round(mid_v, 4), "rsi": round(curr_rsi, 1)},
                 )
 
-        return Signal(SignalType.NEUTRAL, confidence=0.0, metadata={"regime": "range", "rsi": round(curr_rsi, 1)})
+        blockers = []
+        if not (price <= lower * 1.002 or price >= upper * 0.998):
+            blockers.append("not_at_band_edge")
+        if 42 < curr_rsi < 58:
+            blockers.append("rsi_mid_range")
+        return self._neutral_signal("range", rsi=round(curr_rsi, 1), bb_mid=round(mid_v, 4), blockers=blockers)
 
     def _last_swing_low(self, df: pd.DataFrame, lookback: int) -> Optional[float]:
         """Find the most recent significant swing low in the last 50 bars."""

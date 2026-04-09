@@ -342,8 +342,9 @@ class ExecutionEngine:
         ts = datetime.fromtimestamp(candle_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
         if signal is None or signal.type == SignalType.NEUTRAL:
             meta = signal.metadata if signal else {}
+            blockers = ",".join(meta.get("blockers", [])) if meta.get("blockers") else "-"
             logger.info(
-                "HOLD | %s | %s | price=%.4f | regime=%s | htf=%s | rsi=%s | conf=%.2f",
+                "HOLD | %s | %s | price=%.4f | regime=%s | htf=%s | rsi=%s | conf=%.2f | blockers=%s",
                 self.symbol,
                 ts,
                 price,
@@ -351,6 +352,7 @@ class ExecutionEngine:
                 meta.get("htf", "-"),
                 meta.get("rsi", "-"),
                 float(signal.confidence) if signal else 0.0,
+                blockers,
             )
             return
 
