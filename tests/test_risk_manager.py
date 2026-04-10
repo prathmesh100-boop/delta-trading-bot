@@ -61,3 +61,17 @@ def test_update_equity_resets_baseline_on_fresh_session_outlier():
     assert rm._peak_equity == 50.0
     assert rm.can_trade() is True
 
+
+def test_update_equity_clears_stale_circuit_breaker_when_equity_is_healthy():
+    cfg = RiskConfig()
+    rm = RiskManager(cfg, initial_capital=92.0)
+
+    rm._peak_equity = 92.0
+    rm._daily_start_eq = 92.0
+    rm._circuit_breaker = True
+
+    rm.update_equity(92.0)
+
+    assert rm._circuit_breaker is False
+    assert rm.can_trade() is True
+
