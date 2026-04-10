@@ -275,6 +275,30 @@ class DeltaRESTClient:
         products = await self.get_products()
         return next((p for p in products if p.get("symbol") == symbol), None)
 
+    @staticmethod
+    def infer_account_asset(product: Optional[Dict], symbol: str = "") -> str:
+        candidates = []
+        if product:
+            candidates.extend([
+                product.get("settlement_asset", {}).get("symbol") if isinstance(product.get("settlement_asset"), dict) else None,
+                product.get("settlement_currency"),
+                product.get("settlement_currency_symbol"),
+                product.get("settlement_asset_symbol"),
+                product.get("quote_asset", {}).get("symbol") if isinstance(product.get("quote_asset"), dict) else None,
+                product.get("quoting_asset", {}).get("symbol") if isinstance(product.get("quoting_asset"), dict) else None,
+                product.get("quote_currency"),
+                product.get("quote_currency_symbol"),
+                product.get("quote_asset_symbol"),
+            ])
+        if symbol.endswith("USDT"):
+            candidates.append("USDT")
+        if symbol.endswith("USD"):
+            candidates.append("USD")
+        for item in candidates:
+            if isinstance(item, str) and item.strip():
+                return item.strip().upper()
+        return "USDT"
+
     async def get_ticker(self, symbol: str) -> Ticker:
         resp = await self._request("GET", f"/v2/tickers/{symbol}", auth=False)
         r = resp.get("result", {})
