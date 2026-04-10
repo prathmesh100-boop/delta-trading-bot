@@ -385,6 +385,13 @@ class DeltaRESTClient:
         for b in balances:
             if b.get("asset_symbol") == asset:
                 return float(b.get("available_balance", 0))
+        if balances:
+            ranked = sorted(
+                balances,
+                key=lambda b: float(b.get("equity", 0) or b.get("total_balance", 0) or b.get("wallet_balance", 0) or b.get("balance", 0) or b.get("available_balance", 0) or 0),
+                reverse=True,
+            )
+            return float(ranked[0].get("available_balance", 0) or 0)
         return 0.0
 
     async def get_account_equity(self, asset: str = "USDT") -> float:
@@ -397,10 +404,12 @@ class DeltaRESTClient:
         balances = resp.get("result", [])
         equity = 0.0
         available = 0.0
+        matched = False
 
         for b in balances:
             if b.get("asset_symbol") != asset:
                 continue
+            matched = True
             for field in ("equity", "total_balance", "wallet_balance", "balance"):
                 raw = b.get(field)
                 if raw is not None:
@@ -417,6 +426,28 @@ class DeltaRESTClient:
 
         if equity > 0:
             return equity
+
+        if not matched and balances:
+            ranked = []
+            for b in balances:
+                balance_equity = 0.0
+                for field in ("equity", "total_balance", "wallet_balance", "balance", "available_balance"):
+                    raw = b.get(field)
+                    if raw is None:
+                        continue
+                    try:
+                        balance_equity = float(raw)
+                        break
+                    except (TypeError, ValueError):
+                        continue
+                ranked.append((balance_equity, str(b.get("asset_symbol", ""))))
+            ranked.sort(reverse=True)
+            if ranked and ranked[0][0] > 0:
+                logger.warning(
+                    "Requested account asset '%s' not found; using largest wallet equity from '%s' = %.4f",
+                    asset, ranked[0][1], ranked[0][0],
+                )
+                return ranked[0][0]
 
         try:
             positions = await self.get_positions()

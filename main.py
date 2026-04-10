@@ -122,6 +122,7 @@ async def cmd_trade(args):
             return
 
         product_id = product["id"]
+        account_asset = DeltaRESTClient.infer_account_asset(product, args.symbol)
 
         print(f"\n{'='*65}")
         print(f"  🤖 DELTA ALGO BOT — Confluence Strategy")
@@ -129,7 +130,8 @@ async def cmd_trade(args):
         print(f"  Symbol       : {args.symbol}")
         print(f"  Product ID   : {product_id}")
         print(f"  Contract Val : {product.get('contract_value')}")
-        print(f"  Capital      : ${args.capital:.2f} USDT")
+        print(f"  Account Asset: {account_asset}")
+        print(f"  Capital      : ${args.capital:.2f} {account_asset}")
         print(f"  Leverage     : {args.leverage}x")
         print(f"  Risk/Trade   : {args.risk_per_trade*100:.1f}%")
         print(f"  Max DD Halt  : {args.max_drawdown*100:.0f}%")
@@ -152,6 +154,7 @@ async def cmd_trade(args):
             min_confidence     = args.min_confidence,
             trailing_enabled   = True,
             cooldown_minutes   = args.resolution,  # one trade per candle
+            account_asset      = account_asset,
         )
 
         logger.info("🚀 Starting live trading: %s | cap=%.2f | %dx leverage | %dm candles",

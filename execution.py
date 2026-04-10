@@ -71,6 +71,7 @@ class ExecutionEngine:
         min_confidence:     float = 0.55,
         trailing_enabled:   bool = True,
         cooldown_minutes:   int = 15,  # min minutes between entries
+        account_asset:      str = "USDT",
     ):
         self.rest            = rest_client
         self.strategy        = strategy
@@ -83,6 +84,7 @@ class ExecutionEngine:
         self.min_confidence  = min_confidence
         self.trailing_enabled = trailing_enabled
         self.cooldown_seconds = cooldown_minutes * 60
+        self.account_asset   = account_asset
 
         self._candle_buf: List[Dict] = []
         self._current_trade: Optional[TradeRecord] = None
@@ -138,10 +140,10 @@ class ExecutionEngine:
 
         # Fetch balance and update equity
         try:
-            equity = await self.rest.get_account_equity("USDT")
+            equity = await self.rest.get_account_equity(self.account_asset)
             if equity > 0:
                 self.risk.update_equity(equity)
-                logger.info("💰 Account equity: %.4f USDT", equity)
+                logger.info("💰 Account equity: %.4f %s", equity, self.account_asset)
         except Exception as exc:
             logger.warning("Balance fetch failed: %s", exc)
 
@@ -466,7 +468,7 @@ class ExecutionEngine:
         while not self._shutdown:
             await asyncio.sleep(300)
             try:
-                equity = await self.rest.get_account_equity("USDT")
+                equity = await self.rest.get_account_equity(self.account_asset)
                 if equity > 0:
                     self.risk.update_equity(equity)
             except Exception as exc:
