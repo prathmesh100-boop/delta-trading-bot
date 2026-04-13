@@ -128,29 +128,33 @@ def _summarize_exits(exit_df: pd.DataFrame) -> dict:
 
 
 def _group_trade_stats(exit_df: pd.DataFrame, column: str) -> list:
-    if exit_df.empty or column not in exit_df.columns:
-        return []
-    work = exit_df.copy()
-    work[column] = work[column].fillna("").replace("", "unknown")
-  # Ensure `pnl` is a Series before using Series methods (avoid scalar numpy.float64)
+  if exit_df.empty or column not in exit_df.columns:
+    return []
+
+  work = exit_df.copy()
+  work[column] = work[column].fillna("").replace("", "unknown")
+
+  # Ensure `pnl` is always a Series before using Series methods
   if work is None or work.empty or "pnl" not in work.columns:
     work["pnl"] = pd.Series(dtype=float)
   else:
     work["pnl"] = pd.to_numeric(work["pnl"], errors="coerce").fillna(0.0)
-    rows = []
-    for key, grp in work.groupby(column):
-        pnl = grp["pnl"]
-        rows.append({
-            "name": str(key),
-            "trades": int(len(grp)),
-            "win_rate": round(float((pnl > 0).mean() * 100), 1),
-            "total_pnl": round(float(pnl.sum()), 4),
-            "avg_pnl": round(float(pnl.mean()), 4),
-            "best": round(float(pnl.max()), 4),
-            "worst": round(float(pnl.min()), 4),
-        })
-    rows.sort(key=lambda item: (item["total_pnl"], item["win_rate"]), reverse=True)
-    return rows[:12]
+
+  rows = []
+  for key, grp in work.groupby(column):
+    pnl = grp["pnl"]
+    rows.append({
+      "name": str(key),
+      "trades": int(len(grp)),
+      "win_rate": round(float((pnl > 0).mean() * 100), 1),
+      "total_pnl": round(float(pnl.sum()), 4),
+      "avg_pnl": round(float(pnl.mean()), 4),
+      "best": round(float(pnl.max()), 4),
+      "worst": round(float(pnl.min()), 4),
+    })
+
+  rows.sort(key=lambda item: (item["total_pnl"], item["win_rate"]), reverse=True)
+  return rows[:12]
 
 
 def _blocker_stats(hold_df: pd.DataFrame) -> list:
