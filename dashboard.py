@@ -132,7 +132,11 @@ def _group_trade_stats(exit_df: pd.DataFrame, column: str) -> list:
         return []
     work = exit_df.copy()
     work[column] = work[column].fillna("").replace("", "unknown")
-    work["pnl"] = pd.to_numeric(work.get("pnl"), errors="coerce").fillna(0.0)
+  # Ensure `pnl` is a Series before using Series methods (avoid scalar numpy.float64)
+  if work is None or work.empty or "pnl" not in work.columns:
+    work["pnl"] = pd.Series(dtype=float)
+  else:
+    work["pnl"] = pd.to_numeric(work["pnl"], errors="coerce").fillna(0.0)
     rows = []
     for key, grp in work.groupby(column):
         pnl = grp["pnl"]
