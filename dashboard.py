@@ -97,31 +97,23 @@ def _summarize_exits(exit_df: pd.DataFrame) -> dict:
             "current_equity": 0.0,
         }
 
-  # Safely extract `pnl` as a Series even if the source is a scalar or missing.
-  if exit_df is None or (hasattr(exit_df, "empty") and exit_df.empty) or "pnl" not in getattr(exit_df, "columns", []):
-    pnl = pd.Series(dtype=float)
-  else:
-    raw = exit_df["pnl"]
-    pnl = pd.to_numeric(raw, errors="coerce")
-    # If a scalar slipped through, wrap into a Series so methods like .fillna work.
-    if not hasattr(pnl, "fillna"):
-      pnl = pd.Series([pnl])
-    pnl = pnl.fillna(0.0)
+    # Safely extract `pnl` as a Series even if the source is a scalar or missing.
+    if exit_df is None or exit_df.empty or "pnl" not in exit_df.columns:
+        pnl = pd.Series(dtype=float)
+    else:
+        pnl = pd.to_numeric(exit_df["pnl"], errors="coerce").fillna(0.0)
 
-  wins = pnl[pnl > 0]
-  losses = pnl[pnl <= 0]
-  gross_profit = wins.sum()
-  gross_loss = abs(losses.sum())
+    wins = pnl[pnl > 0]
+    losses = pnl[pnl <= 0]
+    gross_profit = wins.sum()
+    gross_loss = abs(losses.sum())
 
-  # Safely extract current equity (may be scalar or Series)
-  if exit_df is None or (hasattr(exit_df, "empty") and exit_df.empty) or "equity" not in getattr(exit_df, "columns", []):
-    current_equity = pd.Series(dtype=float)
-  else:
-    raw_eq = exit_df["equity"]
-    current_equity = pd.to_numeric(raw_eq, errors="coerce")
-    if not hasattr(current_equity, "dropna"):
-      current_equity = pd.Series([current_equity])
-    current_equity = current_equity.dropna()
+    # Safely extract current equity (may be scalar or Series)
+    if exit_df is None or exit_df.empty or "equity" not in exit_df.columns:
+        current_equity = pd.Series(dtype=float)
+    else:
+        current_equity = pd.to_numeric(exit_df["equity"], errors="coerce").dropna()
+
     return {
         "total_pnl": round(float(pnl.sum()), 4),
         "total_trades": int(len(exit_df)),
