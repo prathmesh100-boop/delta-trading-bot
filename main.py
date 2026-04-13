@@ -94,7 +94,7 @@ async def cmd_trade(args):
 
     risk_cfg = RiskConfig(
         risk_per_trade        = args.risk_per_trade,
-        max_open_trades       = 1,
+        max_open_trades       = 3,
         max_drawdown_pct      = args.max_drawdown,
         daily_loss_limit_pct  = args.daily_loss_limit,
         leverage              = float(args.leverage),
