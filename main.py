@@ -48,6 +48,7 @@ logger = logging.getLogger("main")
 
 from api import DeltaRESTClient
 from backtest import Backtester, BacktestConfig
+from dashboard import create_dashboard_app
 from execution import ExecutionEngine
 from risk import RiskConfig, RiskManager
 from strategy import ConfluenceStrategy, load_strategy
@@ -272,6 +273,20 @@ async def cmd_info(args):
         print(f"  OB Imbalance : {ob.imbalance():.3f} (>0=bullish)")
 
 
+def cmd_dashboard(args):
+    import uvicorn
+
+    app = create_dashboard_app(default_symbol=args.symbol, default_resolution=args.resolution)
+    logger.info(
+        "Starting dashboard at http://%s:%d for %s (%sm candles)",
+        args.host,
+        args.port,
+        args.symbol,
+        args.resolution,
+    )
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+
 # ─── Synthetic Data ────────────────────────────────────────────────────────────
 
 def _gen_synthetic(n: int = 3000, seed: int = 42) -> pd.DataFrame:
@@ -342,6 +357,13 @@ Examples:
     i = sub.add_parser("info", help="Show product info and ticker")
     i.add_argument("--symbol", default="ETH_USDT")
 
+    # dashboard
+    d = sub.add_parser("dashboard", help="Launch live monitoring dashboard")
+    d.add_argument("--host", default="127.0.0.1")
+    d.add_argument("--port", type=int, default=8000)
+    d.add_argument("--symbol", default="ETH_USDT")
+    d.add_argument("--resolution", type=int, default=15)
+
     return p
 
 
@@ -355,3 +377,5 @@ if __name__ == "__main__":
         asyncio.run(cmd_status(args))
     elif args.command == "info":
         asyncio.run(cmd_info(args))
+    elif args.command == "dashboard":
+        cmd_dashboard(args)
