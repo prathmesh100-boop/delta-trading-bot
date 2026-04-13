@@ -356,19 +356,6 @@ class ExecutionEngine:
                 float(signal.confidence) if signal else 0.0,
                 blockers,
             )
-            _log_csv({
-                "timestamp": datetime.utcnow().isoformat(),
-                "candle_time": ts,
-                "symbol": self.symbol,
-                "event": "HOLD",
-                "price": round(price, 4),
-                "confidence": round(float(signal.confidence) if signal else 0.0, 4),
-                "regime": meta.get("regime", ""),
-                "htf": meta.get("htf", ""),
-                "rsi": meta.get("rsi", ""),
-                "setup": meta.get("setup", ""),
-                "blockers": blockers,
-            })
             return
 
         side = "BUY" if signal.type == SignalType.LONG else "SELL"
@@ -386,22 +373,6 @@ class ExecutionEngine:
             meta.get("htf", "-"),
             meta.get("rsi", "-"),
         )
-        _log_csv({
-            "timestamp": datetime.utcnow().isoformat(),
-            "candle_time": ts,
-            "symbol": self.symbol,
-            "event": "SIGNAL",
-            "side": "long" if signal.type == SignalType.LONG else "short",
-            "price": round(price, 4),
-            "stop_loss": round(float(signal.stop_loss or 0.0), 4),
-            "take_profit": round(float(signal.take_profit or 0.0), 4) if signal.take_profit else "",
-            "confidence": round(float(signal.confidence), 4),
-            "regime": meta.get("regime", ""),
-            "htf": meta.get("htf", ""),
-            "rsi": meta.get("rsi", ""),
-            "setup": meta.get("setup", ""),
-            "blockers": "",
-        })
 
     async def _tick(self):
         """One strategy tick: fetch candle, generate signal, execute if valid."""
@@ -575,10 +546,6 @@ class ExecutionEngine:
             filled_size = result.filled_size or lots,
             stop_order_id = result.sl_order_id,
             take_profit_order_id = result.tp_order_id,
-            setup = str(signal.metadata.get("setup", "")),
-            signal_confidence = float(signal.confidence),
-            regime = str(signal.metadata.get("regime", "")),
-            htf = str(signal.metadata.get("htf", "")),
         )
         self._current_trade = trade
         self.risk.register_trade(trade)
@@ -600,7 +567,6 @@ class ExecutionEngine:
             "confidence": signal.confidence,
             "regime": signal.metadata.get("regime", ""),
             "htf": signal.metadata.get("htf", ""),
-            "setup": signal.metadata.get("setup", ""),
         })
 
         # Telegram notification
@@ -671,11 +637,6 @@ class ExecutionEngine:
             "lots": trade.size,
             "pnl": pnl,
             "reason": reason,
-            "confidence": trade.signal_confidence,
-            "regime": trade.regime,
-            "htf": trade.htf,
-            "setup": trade.setup,
-            "equity": round(self.risk.current_equity, 4),
         })
 
         # Print running stats

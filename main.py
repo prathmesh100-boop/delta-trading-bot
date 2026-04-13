@@ -77,24 +77,22 @@ async def cmd_trade(args):
         "atr_period":    14,
         "adx_threshold": args.adx_threshold,
         "vol_factor":    args.vol_factor,
-        "rsi_long_min":  40,
-        "rsi_long_max":  60,
-        "rsi_short_min": 40,
-        "rsi_short_max": 60,
-        "max_ema_distance_pct": 0.025,
+        "rsi_long_min":  38,
+        "rsi_long_max":  68,
+        "rsi_short_min": 32,
+        "rsi_short_max": 62,
+        "max_ema_distance_pct": 0.05,
         "funding_long_max": 0.02,
         "funding_short_min": -0.02,
         "sl_atr_mult":   args.sl_atr_mult,
         "tp_rr":         args.tp_rr,
         "swing_lookback": 4,
-        "bb_std":        2.0,
-        "breakout_lookback": 20,
-        "breakout_buffer_atr": 0.12,
+        "bb_std":        1.6,
     })
 
     risk_cfg = RiskConfig(
         risk_per_trade        = args.risk_per_trade,
-        max_open_trades       = 3,
+        max_open_trades       = 1,
         max_drawdown_pct      = args.max_drawdown,
         daily_loss_limit_pct  = args.daily_loss_limit,
         leverage              = float(args.leverage),
@@ -320,10 +318,10 @@ Examples:
     t.add_argument("--max-drawdown",     type=float, default=0.15,  dest="max_drawdown",   help="Max drawdown to halt (0.15=15%%)")
     t.add_argument("--daily-loss-limit", type=float, default=0.08,  dest="daily_loss_limit")
     t.add_argument("--min-confidence",   type=float, default=0.50,  dest="min_confidence")
-    t.add_argument("--adx-threshold",    type=float, default=18.0,  dest="adx_threshold")
+    t.add_argument("--adx-threshold",    type=float, default=16.0,  dest="adx_threshold")
     t.add_argument("--vol-factor",       type=float, default=1.05,  dest="vol_factor")
     t.add_argument("--sl-atr-mult",      type=float, default=1.2,   dest="sl_atr_mult")
-    t.add_argument("--tp-rr",            type=float, default=2.0,   dest="tp_rr",         help="Risk-reward ratio for TP")
+    t.add_argument("--tp-rr",            type=float, default=1.8,   dest="tp_rr",         help="Risk-reward ratio for TP")
     t.add_argument("--fast-ema",         type=int,   default=9,     dest="fast_ema")
     t.add_argument("--mid-ema",          type=int,   default=21,    dest="mid_ema")
     t.add_argument("--slow-ema",         type=int,   default=50,    dest="slow_ema")
