@@ -13,11 +13,11 @@ logger = logging.getLogger(__name__)
 def build_audit_store(storage: StorageConfig | None = None) -> AuditStore:
     cfg = storage or StorageConfig()
     try:
-        return AuditStore(cfg.database_path)
+        return AuditStore(cfg.database_path, config=cfg)
     except Exception as exc:
         fallback_path = cfg.root / f"system-recovery-{uuid.uuid4().hex[:8]}.db"
         logger.warning("Primary audit store unavailable at %s, falling back to %s: %s", cfg.database_path, fallback_path, exc)
-        return AuditStore(fallback_path)
+        return AuditStore(fallback_path, config=StorageConfig(root=fallback_path.parent, database_name=fallback_path.name))
 
 
 def build_portfolio_risk_manager(initial_capital: float, store: AuditStore) -> PortfolioRiskManager:

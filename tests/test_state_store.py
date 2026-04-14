@@ -37,3 +37,15 @@ def test_state_store_round_trip(tmp_path: Path):
 
     store.clear_trade("BTC_USDT")
     assert store.load_trade("BTC_USDT") is None
+
+
+def test_state_store_quarantines_corrupt_file(tmp_path: Path):
+    store = StateStore(root=tmp_path / "state")
+    broken_path = store._path_for_symbol("ETH_USDT")
+    broken_path.write_text("{not-json", encoding="utf-8")
+
+    loaded = store.load_trade("ETH_USDT")
+
+    assert loaded is None
+    assert not broken_path.exists()
+    assert broken_path.with_suffix(".corrupt").exists()

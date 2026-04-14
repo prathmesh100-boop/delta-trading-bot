@@ -3,12 +3,15 @@ state_store.py - durable local state for execution recovery
 """
 
 import json
+import logging
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from risk import TradeRecord
+
+logger = logging.getLogger(__name__)
 
 
 class StateStore:
@@ -25,16 +28,28 @@ class StateStore:
         payload["entry_time"] = trade.entry_time.isoformat()
         payload["exit_time"] = trade.exit_time.isoformat() if trade.exit_time else None
         payload["updated_at"] = datetime.utcnow().isoformat()
-        self._path_for_symbol(trade.symbol).write_text(
+        path = self._path_for_symbol(trade.symbol)
+        temp_path = path.with_suffix(".tmp")
+        temp_path.write_text(
             json.dumps(payload, indent=2, sort_keys=True),
             encoding="utf-8",
         )
+        temp_path.replace(path)
 
     def load_trade(self, symbol: str) -> Optional[TradeRecord]:
         path = self._path_for_symbol(symbol)
         if not path.exists():
             return None
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("State file unreadable for %s: %s", symbol, exc)
+            corrupt_path = path.with_suffix(".corrupt")
+            try:
+                path.replace(corrupt_path)
+            except OSError:
+                pass
+            return None
         payload.pop("updated_at", None)
         payload["entry_time"] = datetime.fromisoformat(payload["entry_time"])
         if payload.get("exit_time"):

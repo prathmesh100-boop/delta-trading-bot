@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
+from delta_bot.config import StorageConfig
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -22,8 +24,9 @@ def _json_default(value: Any) -> Any:
 
 
 class AuditStore:
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, *, config: StorageConfig | None = None):
         self.db_path = Path(db_path)
+        self.config = config or StorageConfig(root=self.db_path.parent, database_name=self.db_path.name)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -31,8 +34,11 @@ class AuditStore:
     def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=MEMORY;")
+        conn.execute(f"PRAGMA busy_timeout={int(self.config.sqlite_busy_timeout_ms)};")
+        conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA temp_store=MEMORY;")
+        conn.execute("PRAGMA cache_size=-20000;")
         try:
             yield conn
             conn.commit()

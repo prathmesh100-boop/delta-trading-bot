@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
@@ -10,7 +10,7 @@ from fastapi.responses import HTMLResponse
 from api import DeltaRESTClient
 from delta_bot.config import StorageConfig
 from delta_bot.dashboard_view import render_dashboard_html
-from delta_bot.dashboard_snapshot import monitoring_summary, trade_summary
+from delta_bot.dashboard_snapshot import control_plane_summary, monitoring_summary, trade_summary
 from delta_bot.runtime import build_audit_store
 
 
@@ -24,10 +24,14 @@ def create_backend_app() -> FastAPI:
 
     @app.get("/api/health")
     async def health() -> Dict[str, Any]:
+        runtime_items = store.list_runtime_states()
+        control_plane = control_plane_summary(runtime_items, store.recent_events(limit=50))
         return {
-            "ok": True,
+            "ok": control_plane["status"] != "error",
+            "status": control_plane["status"],
             "api_configured": bool(os.getenv("DELTA_API_KEY", "").strip() and os.getenv("DELTA_API_SECRET", "").strip()),
             "db_path": str(store.db_path),
+            "runtime": control_plane["runtime"],
         }
 
     @app.get("/api/portfolio")
@@ -45,6 +49,11 @@ def create_backend_app() -> FastAPI:
     @app.get("/api/runtime")
     async def runtime(namespace: str | None = None) -> Dict[str, Any]:
         return {"items": store.list_runtime_states(namespace=namespace)}
+
+    @app.get("/api/system/health")
+    async def system_health() -> Dict[str, Any]:
+        runtime_items = store.list_runtime_states()
+        return control_plane_summary(runtime_items, store.recent_events(limit=100))
 
     @app.get("/api/account")
     async def account(symbol: str = Query(default="ETH_USDT")) -> Dict[str, Any]:
@@ -76,6 +85,7 @@ def create_backend_app() -> FastAPI:
         recent_trades = store.recent_trades(limit=80)
         runtime_items = store.list_runtime_states()
         portfolio = store.latest_portfolio_snapshot() or {}
+        control_plane = control_plane_summary(runtime_items, recent_events)
         errors: List[str] = []
 
         api_key = os.getenv("DELTA_API_KEY", "").strip()
@@ -107,10 +117,11 @@ def create_backend_app() -> FastAPI:
         return {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "health": {
-                "ok": True,
+                "ok": control_plane["status"] != "error",
                 "api_configured": bool(api_key and api_secret),
                 "db_path": str(store.db_path),
             },
+            "control_plane": control_plane,
             "portfolio": portfolio,
             "trade_summary": trade_summary(recent_trades),
             "monitoring": monitoring_summary(recent_events),

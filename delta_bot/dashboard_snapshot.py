@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Dict, List
+
+from delta_bot.monitoring import runtime_health_summary
 
 
 def trade_summary(items: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -35,4 +38,26 @@ def monitoring_summary(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         "error_count": error_count,
         "latest_risk_event": risk_events[0] if risk_events else None,
         "latest_error_event": next((item for item in events if item.get("severity") in {"error", "critical"}), None),
+    }
+
+
+def control_plane_summary(
+    runtime_items: List[Dict[str, Any]],
+    events: List[Dict[str, Any]],
+    *,
+    stale_after_seconds: float = 180.0,
+) -> Dict[str, Any]:
+    runtime_summary = runtime_health_summary(
+        runtime_items,
+        stale_after_seconds=stale_after_seconds,
+        now=datetime.now(timezone.utc),
+    )
+    event_summary = monitoring_summary(events)
+    overall_status = runtime_summary["status"]
+    if event_summary["error_count"] and overall_status == "ok":
+        overall_status = "degraded"
+    return {
+        "status": overall_status,
+        "runtime": runtime_summary,
+        "events": event_summary,
     }

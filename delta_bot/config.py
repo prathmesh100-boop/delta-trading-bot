@@ -8,6 +8,7 @@ from pathlib import Path
 class StorageConfig:
     root: Path = Path.cwd() / ".bot_data"
     database_name: str = "system.db"
+    sqlite_busy_timeout_ms: int = 15_000
 
     @property
     def database_path(self) -> Path:
@@ -23,3 +24,9 @@ class PortfolioRiskSettings:
     max_drawdown_pct: float = 0.15
     daily_loss_limit_pct: float = 0.08
 
+
+@dataclass
+class MonitoringConfig:
+    stale_after_seconds: float = 180.0
+    slow_loop_threshold_ms: float = 2_500.0
+    persist_interval_seconds: float = 15.0

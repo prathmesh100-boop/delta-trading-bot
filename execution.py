@@ -30,6 +30,7 @@ from api import (
     OrderSide,
     OrderType,
 )
+from delta_bot.monitoring import RuntimeMonitor
 from delta_bot.portfolio import PortfolioRiskManager
 from delta_bot.storage import AuditStore
 from risk import RiskManager, TradeRecord
@@ -86,6 +87,7 @@ class ExecutionEngine:
         self.account_asset   = account_asset
         self.audit_store     = audit_store
         self.portfolio_risk  = portfolio_risk
+        self.monitor         = RuntimeMonitor(audit_store, symbol=symbol) if audit_store else None
 
         self._candle_buf: List[Dict] = []
         self._current_trade: Optional[TradeRecord] = None
@@ -110,9 +112,22 @@ class ExecutionEngine:
             severity=severity,
         )
 
+    def _monitor_heartbeat(self, component: str, **details) -> None:
+        if self.monitor:
+            self.monitor.heartbeat(component, **details)
+
+    def _monitor_loop_timing(self, component: str, duration_ms: float, **details) -> None:
+        if self.monitor:
+            self.monitor.loop_timing(component, duration_ms, **details)
+
+    def _monitor_error(self, component: str, exc: Exception, **details) -> None:
+        if self.monitor:
+            self.monitor.error(component, str(exc), **details)
+
     # ── Startup ───────────────────────────────────────────────────────────────
 
     async def bootstrap_history(self):
+        self._monitor_heartbeat("engine_bootstrap", product_id=self.product_id)
         self._audit_event("system", "engine_bootstrap_started", {"product_id": self.product_id})
         logger.info("🚀 Bootstrapping %s (product_id=%d)…", self.symbol, self.product_id)
 
@@ -217,6 +232,7 @@ class ExecutionEngine:
             if price > 0:
                 self._ws_price = price
                 self._ws_mark  = float(data.get("mark_price", price))
+                self._monitor_heartbeat("market_data_ws", price=round(price, 6))
                 await self._check_sl_tp(price)
                 if self.trailing_enabled:
                     await self._update_trailing(price)
@@ -317,10 +333,14 @@ class ExecutionEngine:
         await asyncio.sleep(5)
         logger.info("📡 Signal loop started")
         while not self._shutdown:
+            started = time.perf_counter()
             try:
                 await self._tick()
             except Exception as exc:
                 logger.error("Signal tick error: %s", exc, exc_info=True)
+                self._monitor_error("signal_loop", exc)
+            else:
+                self._monitor_loop_timing("signal_loop", (time.perf_counter() - started) * 1000.0)
             await asyncio.sleep(self._seconds_until_next_close())
 
     def _seconds_until_next_close(self, buffer_seconds: int = 2) -> float:
@@ -413,6 +433,7 @@ class ExecutionEngine:
             self._candle_buf = sorted(self._candle_buf, key=lambda x: x["timestamp"])[-350:]
         except Exception as exc:
             logger.warning("Candle fetch failed: %s", exc)
+            self._monitor_error("candle_fetch", exc)
             return
 
         if len(self._candle_buf) < 210:
@@ -428,6 +449,7 @@ class ExecutionEngine:
             signal = normalize_signal(self.strategy.generate_signal(df, self.symbol, self._funding))
         except Exception as exc:
             logger.error("Strategy error: %s", exc, exc_info=True)
+            self._monitor_error("strategy_generate_signal", exc)
             return
 
         price = self._ws_price or float(df["close"].iloc[-1])
@@ -477,6 +499,7 @@ class ExecutionEngine:
     async def _balance_loop(self):
         while not self._shutdown:
             await asyncio.sleep(300)
+            started = time.perf_counter()
             try:
                 equity = await self.rest.get_account_equity(self.account_asset)
                 if equity > 0:
@@ -485,10 +508,12 @@ class ExecutionEngine:
                         self.portfolio_risk.sync_equity(equity)
             except Exception as exc:
                 logger.debug("Balance refresh failed: %s", exc)
+                self._monitor_error("balance_refresh", exc)
             try:
                 self._funding = await self.rest.get_funding_rate(self.symbol)
             except Exception:
                 pass
+            self._monitor_loop_timing("balance_loop", (time.perf_counter() - started) * 1000.0)
 
     # ── Entry ─────────────────────────────────────────────────────────────────
 
