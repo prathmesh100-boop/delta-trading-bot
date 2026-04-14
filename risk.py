@@ -154,6 +154,12 @@ class RiskManager:
             self.current_capital = new_equity
             if new_equity > self._peak_equity:
                 self._peak_equity = new_equity
+            if (
+                self._circuit_breaker
+                and self._drawdown_pct() < self.config.max_drawdown_pct
+                and self._daily_loss_pct() < self.config.daily_loss_limit_pct
+            ):
+                self._circuit_breaker = False
 
         today = datetime.now(timezone.utc).date()
         if today != self._daily_reset_date:

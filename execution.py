@@ -30,6 +30,8 @@ from api import (
     OrderSide,
     OrderType,
 )
+from delta_bot.portfolio import PortfolioRiskManager
+from delta_bot.storage import AuditStore
 from risk import RiskManager, TradeRecord
 from state_store import StateStore
 from strategy import ConfluenceStrategy, Signal, SignalType
@@ -67,6 +69,8 @@ class ExecutionEngine:
         trailing_enabled:   bool = True,
         cooldown_minutes:   int = 15,
         account_asset:      str = "USDT",
+        audit_store:        Optional[AuditStore] = None,
+        portfolio_risk:     Optional[PortfolioRiskManager] = None,
     ):
         self.rest            = rest_client
         self.strategy        = strategy
@@ -80,6 +84,8 @@ class ExecutionEngine:
         self.trailing_enabled = trailing_enabled
         self.cooldown_seconds = cooldown_minutes * 60
         self.account_asset   = account_asset
+        self.audit_store     = audit_store
+        self.portfolio_risk  = portfolio_risk
 
         self._candle_buf: List[Dict] = []
         self._current_trade: Optional[TradeRecord] = None
@@ -93,9 +99,21 @@ class ExecutionEngine:
         self._last_signal_candle_ts: int = 0
         self._state_store = StateStore()
 
+    def _audit_event(self, category: str, event_type: str, payload: Dict, severity: str = "info") -> None:
+        if not self.audit_store:
+            return
+        self.audit_store.record_event(
+            category,
+            event_type,
+            payload,
+            symbol=self.symbol,
+            severity=severity,
+        )
+
     # ── Startup ───────────────────────────────────────────────────────────────
 
     async def bootstrap_history(self):
+        self._audit_event("system", "engine_bootstrap_started", {"product_id": self.product_id})
         logger.info("🚀 Bootstrapping %s (product_id=%d)…", self.symbol, self.product_id)
 
         self._lot_size = await self.rest.get_lot_size(self.symbol)
@@ -133,6 +151,8 @@ class ExecutionEngine:
             equity = await self.rest.get_account_equity(self.account_asset)
             if equity > 0:
                 self.risk.update_equity(equity)
+                if self.portfolio_risk:
+                    self.portfolio_risk.sync_equity(equity)
                 logger.info("💰 Account equity: %.4f %s", equity, self.account_asset)
         except Exception as exc:
             logger.warning("Balance fetch failed: %s", exc)
@@ -171,6 +191,11 @@ class ExecutionEngine:
         ws_task      = asyncio.create_task(ws.connect())
         signal_task  = asyncio.create_task(self._signal_loop())
         balance_task = asyncio.create_task(self._balance_loop())
+        self._audit_event(
+            "system",
+            "engine_started",
+            {"resolution_minutes": self.resolution, "min_confidence": self.min_confidence},
+        )
 
         logger.info("✅ Engine running: %s | resolution=%dm | min_confidence=%.2f",
                     self.symbol, self.resolution, self.min_confidence)
@@ -178,6 +203,7 @@ class ExecutionEngine:
             await asyncio.gather(ws_task, signal_task, balance_task)
         except asyncio.CancelledError:
             logger.info("Engine shutting down…")
+            self._audit_event("system", "engine_shutdown", {})
             await ws.disconnect()
 
     # ── WebSocket Handler ─────────────────────────────────────────────────────
@@ -320,6 +346,19 @@ class ExecutionEngine:
                 meta.get("rsi", "-"), float(signal.confidence) if signal else 0.0,
                 blockers,
             )
+            self._audit_event(
+                "decision",
+                "hold",
+                {
+                    "candle_time": ts,
+                    "price": price,
+                    "regime": meta.get("regime", "-"),
+                    "htf": meta.get("htf", "-"),
+                    "rsi": meta.get("rsi", "-"),
+                    "confidence": float(signal.confidence) if signal else 0.0,
+                    "blockers": meta.get("blockers", []),
+                },
+            )
             return
 
         side = "BUY" if signal.type == SignalType.LONG else "SELL"
@@ -334,6 +373,23 @@ class ExecutionEngine:
             meta.get("setup_type", "-"),
             quality.get("grade", "-"),
             meta.get("regime", "-"), meta.get("htf", "-"), meta.get("rsi", "-"),
+        )
+        self._audit_event(
+            "decision",
+            "signal",
+            {
+                "candle_time": ts,
+                "side": side.lower(),
+                "price": price,
+                "stop_loss": float(signal.stop_loss or 0.0),
+                "take_profit": float(signal.take_profit or 0.0) if signal.take_profit else None,
+                "confidence": float(signal.confidence),
+                "setup_type": meta.get("setup_type", "-"),
+                "entry_grade": quality.get("grade", "-"),
+                "regime": meta.get("regime", "-"),
+                "htf": meta.get("htf", "-"),
+                "rsi": meta.get("rsi", "-"),
+            },
         )
 
     async def _tick(self):
@@ -384,6 +440,12 @@ class ExecutionEngine:
         if not self.risk.check_signal(signal):
             self._last_signal_candle_ts = closed_candle_ts
             logger.info("Signal rejected by risk manager")
+            self._audit_event(
+                "risk",
+                "signal_rejected_local_risk",
+                {"confidence": signal.confidence, "candle_ts": closed_candle_ts},
+                severity="warning",
+            )
             return
 
         time_since_last = time.time() - self._last_entry_ts
@@ -419,6 +481,8 @@ class ExecutionEngine:
                 equity = await self.rest.get_account_equity(self.account_asset)
                 if equity > 0:
                     self.risk.update_equity(equity)
+                    if self.portfolio_risk:
+                        self.portfolio_risk.sync_equity(equity)
             except Exception as exc:
                 logger.debug("Balance refresh failed: %s", exc)
             try:
@@ -441,7 +505,31 @@ class ExecutionEngine:
         if lots < 1:
             logger.warning("Lots < 1, skipping (notional=%.2f price=%.4f lot=%.6f)",
                            notional, price, self._lot_size)
+            self._audit_event(
+                "risk",
+                "signal_rejected_position_too_small",
+                {"notional_usd": notional, "price": price, "lot_size": self._lot_size},
+                severity="warning",
+            )
             return
+
+        actual_notional = lots * self._lot_size * price
+        proposed_risk = abs(price - signal.stop_loss) * lots * self._lot_size
+        if self.portfolio_risk:
+            allowed, reason = self.portfolio_risk.can_open_trade(
+                self.symbol,
+                proposed_notional_usd=actual_notional,
+                proposed_risk_usd=proposed_risk,
+            )
+            if not allowed:
+                logger.warning("Portfolio risk rejected trade: %s", reason)
+                self._audit_event(
+                    "risk",
+                    "signal_rejected_portfolio_risk",
+                    {"reason": reason, "notional_usd": actual_notional, "proposed_risk_usd": proposed_risk},
+                    severity="warning",
+                )
+                return
 
         side = OrderSide.BUY if signal.type == SignalType.LONG else OrderSide.SELL
         coid = f"bot_{self.symbol}_{int(time.time())}"
@@ -515,8 +603,32 @@ class ExecutionEngine:
         )
         self._current_trade = trade
         self.risk.register_trade(trade)
+        if self.portfolio_risk:
+            self.portfolio_risk.register_trade(
+                trade.id,
+                symbol=trade.symbol,
+                side=trade.side,
+                notional_usd=trade.notional_usd,
+                risk_usd=proposed_risk,
+            )
         self._last_entry_ts = time.time()
         self._persist_trade_state()
+        if self.audit_store:
+            self.audit_store.upsert_trade(trade, "open")
+        self._audit_event(
+            "execution",
+            "entry_opened",
+            {
+                "trade_id": trade.id,
+                "side": trade.side,
+                "entry_price": trade.entry_price,
+                "stop_loss": trade.stop_loss,
+                "take_profit": trade.take_profit,
+                "notional_usd": trade.notional_usd,
+                "setup_type": trade.setup_type,
+                "entry_grade": trade.entry_grade,
+            },
+        )
 
         # Write to decisions.csv (detailed signal log)
         _log_csv(DECISIONS_CSV, {
@@ -591,8 +703,13 @@ class ExecutionEngine:
         pnl = trade.net_pnl or 0.0
 
         self.risk.close_trade(trade, exit_price)
+        if self.portfolio_risk:
+            self.portfolio_risk.close_trade(trade.id, pnl)
         self._state_store.clear_trade(self.symbol)
         self._current_trade = None
+        if self.audit_store:
+            self.audit_store.upsert_trade(trade, "closed")
+            self.audit_store.delete_runtime_state("engine", f"active_trade:{self.symbol}")
 
         pnl_emoji = "✅" if pnl >= 0 else "❌"
         logger.info(
@@ -642,6 +759,19 @@ class ExecutionEngine:
             "setup_type":     trade.setup_type,
             "entry_grade":    trade.entry_grade,
         })
+        self._audit_event(
+            "execution",
+            "trade_closed",
+            {
+                "trade_id": trade.id,
+                "exit_price": exit_price,
+                "pnl": pnl,
+                "reason": reason,
+                "setup_type": trade.setup_type,
+                "entry_grade": trade.entry_grade,
+            },
+            severity="warning" if pnl < 0 else "info",
+        )
 
         stats = self.risk.get_stats()
         logger.info(
@@ -660,6 +790,20 @@ class ExecutionEngine:
     def _persist_trade_state(self):
         if self._current_trade and not self._current_trade.closed:
             self._state_store.save_trade(self._current_trade)
+            if self.audit_store:
+                self.audit_store.set_runtime_state(
+                    "engine",
+                    f"active_trade:{self.symbol}",
+                    {
+                        "symbol": self.symbol,
+                        "trade_id": self._current_trade.id,
+                        "entry_price": self._current_trade.entry_price,
+                        "stop_loss": self._current_trade.stop_loss,
+                        "take_profit": self._current_trade.take_profit,
+                        "side": self._current_trade.side,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
 
     async def _recover_trade_state(self):
         persisted = self._state_store.load_trade(self.symbol)
@@ -670,12 +814,25 @@ class ExecutionEngine:
         if recovered and not recovered.closed:
             self._current_trade = recovered
             self.risk.register_trade(recovered)
+            if self.portfolio_risk:
+                risk_usd = abs(recovered.entry_price - recovered.stop_loss) * recovered.filled_size * recovered.contract_value
+                self.portfolio_risk.register_trade(
+                    recovered.id,
+                    symbol=recovered.symbol,
+                    side=recovered.side,
+                    notional_usd=recovered.notional_usd,
+                    risk_usd=risk_usd,
+                )
             self._persist_trade_state()
+            if self.audit_store:
+                self.audit_store.upsert_trade(recovered, "open")
             logger.info("Recovered live trade: %s %s %d lots @ %.4f",
                         recovered.symbol, recovered.side.upper(),
                         recovered.filled_size, recovered.entry_price)
         else:
             self._state_store.clear_trade(self.symbol)
+            if self.audit_store:
+                self.audit_store.delete_runtime_state("engine", f"active_trade:{self.symbol}")
 
     async def _reconcile_trade_with_exchange(self, trade: TradeRecord) -> Optional[TradeRecord]:
         entry_order = await self._fetch_best_order_snapshot(trade.order_id, trade.entry_client_order_id)

@@ -51,6 +51,8 @@ logger = logging.getLogger("main")
 
 from api import DeltaRESTClient
 from backtest import Backtester, BacktestConfig
+from delta_bot.config import StorageConfig
+from delta_bot.runtime import build_audit_store, build_portfolio_risk_manager
 from execution import ExecutionEngine
 from risk import RiskConfig, RiskManager
 from strategy import ConfluenceStrategy, load_strategy
@@ -117,6 +119,19 @@ async def cmd_trade(args):
     # This means each bot's drawdown/risk is calculated from its own slice,
     # not the total account balance.
     risk_mgr = RiskManager(risk_cfg, initial_capital=args.capital)
+    audit_store = build_audit_store(StorageConfig())
+    portfolio_risk = build_portfolio_risk_manager(initial_capital=args.capital, store=audit_store)
+    audit_store.record_event(
+        "system",
+        "trade_command_started",
+        {
+            "symbol": args.symbol,
+            "capital": args.capital,
+            "leverage": args.leverage,
+            "resolution": args.resolution,
+        },
+        symbol=args.symbol,
+    )
 
     async with DeltaRESTClient(key, secret) as rest:
         products = await rest.get_products()
@@ -176,6 +191,8 @@ async def cmd_trade(args):
             trailing_enabled   = True,
             cooldown_minutes   = args.resolution,
             account_asset      = account_asset,
+            audit_store        = audit_store,
+            portfolio_risk     = portfolio_risk,
         )
 
         logger.info("🚀 Starting V8: %s | allocated=%.2f | %dx leverage | %dm candles",
@@ -380,6 +397,15 @@ async def cmd_info(args):
         print(f"  OB Imbalance : {ob.imbalance():.3f} (>0=bullish)")
 
 
+def cmd_api_server(args):
+    import uvicorn
+    from backend_api import create_backend_app
+
+    app = create_backend_app()
+    logger.info("Starting control API on http://%s:%d", args.host, args.port)
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+
 def _gen_synthetic(n: int = 3000, seed: int = 42) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     dt  = 1 / (24 * 365)
@@ -463,6 +489,11 @@ Backtest:
     i = sub.add_parser("info", help="Show product info and ticker")
     i.add_argument("--symbol", default="ETHUSD")
 
+    # backend API
+    api_server = sub.add_parser("api-server", help="Run the operational FastAPI backend")
+    api_server.add_argument("--host", default="127.0.0.1")
+    api_server.add_argument("--port", type=int, default=8000)
+
     return p
 
 
@@ -478,3 +509,5 @@ if __name__ == "__main__":
         asyncio.run(cmd_status(args))
     elif args.command == "info":
         asyncio.run(cmd_info(args))
+    elif args.command == "api-server":
+        cmd_api_server(args)
