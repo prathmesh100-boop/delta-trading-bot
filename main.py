@@ -1,27 +1,30 @@
 """
-main.py — Delta Exchange Algo Trading Bot
-Institutional Confluence Strategy: MTF Trend + Structure + Momentum
+main.py — Delta Exchange Algo Trading Bot V8
+Multi-coin architecture + per-trade analytics + true dip buying
 
 Usage:
-    # Live trading
-    python main.py trade --symbol ETH_USDT --capital 500 --leverage 5
+    # Single bot (all capital)
+    python main.py trade --symbol BTCUSD --capital 92 --leverage 3
 
-    # Backtest on synthetic data
-    python main.py backtest --symbol ETH_USDT
+    # Multi-coin: split capital correctly across bots
+    # Run each in a separate terminal / systemd service:
+    python main.py trade --symbol BTCUSD --capital 30 --leverage 3
+    python main.py trade --symbol ETHUSD --capital 30 --leverage 3
+    python main.py trade --symbol SOLUSD --capital 30 --leverage 3
 
-    # Check account status
+    # Backtest
+    python main.py backtest --symbol BTCUSD
+    python main.py analytics          ← NEW: show per-setup profitability
     python main.py status
+    python main.py info --symbol ETHUSD
 
-    # Check product info
-    python main.py info --symbol ETH_USDT
-
-REQUIRED (.env file):
-    DELTA_API_KEY=your_key
-    DELTA_API_SECRET=your_secret
-
-OPTIONAL (.env file):
-    TELEGRAM_BOT_TOKEN=your_token
-    TELEGRAM_CHAT_ID=your_chat_id
+V8 Key Changes:
+  - MULTI-COIN FIX: --capital now means "this bot's allocated slice"
+    Each bot only risks from its own slice. No more overlapping capital.
+  - Per-trade analytics: setup_type, entry_grade, quality_score in all CSVs
+  - True dip buying: EMA21 must be touched in last 3 bars (not just "near")
+  - Extension guard: blocks entries when price is extended from EMA21
+  - analytics command: shows profitability by setup type and entry grade
 """
 
 from dotenv import load_dotenv
@@ -77,72 +80,88 @@ async def cmd_trade(args):
         "atr_period":    14,
         "adx_threshold": args.adx_threshold,
         "vol_factor":    args.vol_factor,
-        "rsi_long_min":  40,
-        "rsi_long_max":  60,
-        "rsi_short_min": 40,
-        "rsi_short_max": 60,
-        "max_ema_distance_pct": 0.025,
-        "funding_long_max": 0.02,
-        "funding_short_min": -0.02,
-        "sl_atr_mult":   args.sl_atr_mult,
-        "tp_rr":         args.tp_rr,
-        "swing_lookback": 4,
+        # V8 RSI zones (unchanged from V7 — correct)
+        "rsi_long_min":  35,
+        "rsi_long_max":  52,
+        "rsi_short_min": 48,
+        "rsi_short_max": 65,
+        # V8: dip-buying parameters
+        "ema_touch_lookback":   3,     # bars to look back for EMA21 touch
+        "extension_atr_mult":  1.5,   # block if price > 1.5×ATR from EMA21
+        "max_ema_distance_pct": 0.03,  # max 3% from EMA21 for entry
+        "funding_long_max":  0.015,
+        "funding_short_min": -0.015,
+        "sl_atr_mult":  args.sl_atr_mult,
+        "tp_rr":        args.tp_rr,
+        "swing_lookback": 5,
         "bb_std":        2.0,
-        "breakout_lookback": 20,
-        "breakout_buffer_atr": 0.12,
     })
 
     risk_cfg = RiskConfig(
         risk_per_trade        = args.risk_per_trade,
-        max_open_trades       = 3,
+        max_open_trades       = 1,
         max_drawdown_pct      = args.max_drawdown,
         daily_loss_limit_pct  = args.daily_loss_limit,
         leverage              = float(args.leverage),
         max_position_size_pct = 0.25,
-        breakeven_trigger_pct = 0.005,
-        breakeven_buffer_pct  = 0.001,
-        profit_lock_trigger_pct = 0.010,
-        profit_lock_trail_pct   = 0.004,
-        min_confidence        = args.min_confidence,
+        # V7 trailing (correct — keep unchanged)
+        breakeven_trigger_pct   = 0.010,
+        breakeven_buffer_pct    = 0.002,
+        profit_lock_trigger_pct = 0.018,
+        profit_lock_trail_pct   = 0.008,
+        min_confidence          = args.min_confidence,
     )
     risk_cfg.leverage_by_symbol[args.symbol] = float(args.leverage)
 
+    # V8: risk manager is initialised with the ALLOCATED capital slice
+    # This means each bot's drawdown/risk is calculated from its own slice,
+    # not the total account balance.
     risk_mgr = RiskManager(risk_cfg, initial_capital=args.capital)
 
     async with DeltaRESTClient(key, secret) as rest:
-        # Find product
         products = await rest.get_products()
         product  = next((p for p in products if p.get("symbol") == args.symbol), None)
 
         if not product:
             print(f"\n❌ Symbol '{args.symbol}' not found on Delta Exchange.")
-            print("\nAvailable USDT perpetuals:")
+            print("\nAvailable USD/USDT perpetuals:")
             for p in products:
                 sym = p.get("symbol", "")
                 if "USDT" in sym or "USD" in sym:
                     print(f"  {sym}")
             return
 
-        product_id = product["id"]
+        product_id    = product["id"]
         account_asset = DeltaRESTClient.infer_account_asset(product, args.symbol)
 
-        print(f"\n{'='*65}")
-        print(f"  🤖 DELTA ALGO BOT — Confluence Strategy")
-        print(f"{'='*65}")
-        print(f"  Symbol       : {args.symbol}")
-        print(f"  Product ID   : {product_id}")
-        print(f"  Contract Val : {product.get('contract_value')}")
-        print(f"  Account Asset: {account_asset}")
-        print(f"  Capital      : ${args.capital:.2f} {account_asset}")
-        print(f"  Leverage     : {args.leverage}x")
-        print(f"  Risk/Trade   : {args.risk_per_trade*100:.1f}%")
-        print(f"  Max DD Halt  : {args.max_drawdown*100:.0f}%")
-        print(f"  Daily Loss   : {args.daily_loss_limit*100:.0f}%")
-        print(f"  Candle Res   : {args.resolution}m")
-        print(f"  Min Conf     : {args.min_confidence}")
-        print(f"  ADX Thresh   : {args.adx_threshold}")
-        print(f"  TP RR        : {args.tp_rr}R")
-        print(f"{'='*65}\n")
+        print(f"\n{'='*68}")
+        print(f"  🤖 DELTA ALGO BOT V8 — True Dip Buying + Analytics")
+        print(f"{'='*68}")
+        print(f"  Symbol          : {args.symbol}")
+        print(f"  Product ID      : {product_id}")
+        print(f"  Contract Val    : {product.get('contract_value')}")
+        print(f"  Account Asset   : {account_asset}")
+        print(f"  Allocated Capital: ${args.capital:.2f} {account_asset}  ← this bot's slice only")
+        print(f"  Leverage        : {args.leverage}x")
+        print(f"  Risk/Trade      : {args.risk_per_trade*100:.1f}%")
+        print(f"  Max DD Halt     : {args.max_drawdown*100:.0f}%")
+        print(f"  Daily Loss Halt : {args.daily_loss_limit*100:.0f}%")
+        print(f"  Candle Res      : {args.resolution}m")
+        print(f"  Min Confidence  : {args.min_confidence}")
+        print(f"  ADX Threshold   : {args.adx_threshold}")
+        print(f"  TP RR           : {args.tp_rr}R")
+        print(f"  RSI Long        : 35–52  (pullback zone)")
+        print(f"  RSI Short       : 48–65  (pullback zone)")
+        print(f"  EMA Touch LB    : 3 bars (true dip buying)")
+        print(f"  Extension Guard : 1.5× ATR max distance from EMA21")
+        print(f"  BE Trigger      : +1.0%  (V7 fix, kept)")
+        print(f"  Trail Width     : 0.8%   (V7 fix, kept)")
+        print(f"{'='*68}")
+        print(f"")
+        print(f"  ⚠️  MULTI-COIN SETUP: if running multiple bots, each must")
+        print(f"     use --capital set to its OWN slice (e.g. 30 each for 3 bots)")
+        print(f"     Total should not exceed your actual account balance.")
+        print(f"{'='*68}\n")
 
         engine = ExecutionEngine(
             rest_client        = rest,
@@ -155,11 +174,11 @@ async def cmd_trade(args):
             api_secret         = secret,
             min_confidence     = args.min_confidence,
             trailing_enabled   = True,
-            cooldown_minutes   = args.resolution,  # one trade per candle
+            cooldown_minutes   = args.resolution,
             account_asset      = account_asset,
         )
 
-        logger.info("🚀 Starting live trading: %s | cap=%.2f | %dx leverage | %dm candles",
+        logger.info("🚀 Starting V8: %s | allocated=%.2f | %dx leverage | %dm candles",
                     args.symbol, args.capital, args.leverage, args.resolution)
 
         try:
@@ -170,7 +189,7 @@ async def cmd_trade(args):
 
 def cmd_backtest(args):
     print(f"\n{'='*65}")
-    print(f"  📊 BACKTEST: Confluence Strategy on {args.symbol}")
+    print(f"  📊 BACKTEST V8: {args.symbol}")
     print(f"{'='*65}")
 
     strategy = ConfluenceStrategy()
@@ -180,7 +199,7 @@ def cmd_backtest(args):
         taker_fee       = 0.0005,
         slippage_pct    = 0.0003,
         leverage        = float(args.leverage),
-        min_confidence  = 0.55,
+        min_confidence  = 0.58,
     )
 
     if getattr(args, "data_file", None) and os.path.exists(args.data_file):
@@ -191,8 +210,7 @@ def cmd_backtest(args):
         print("  Generating synthetic BTC data (3000 bars)…")
         df = _gen_synthetic(n=3000)
 
-    # Walk-forward: 70% train, 30% test
-    split   = int(len(df) * 0.70)
+    split    = int(len(df) * 0.70)
     train_df = df.iloc[:split]
     test_df  = df.iloc[split:]
 
@@ -210,22 +228,114 @@ def cmd_backtest(args):
         print("\n  Last 10 trades (test set):")
         for t in test_result.trades[-10:]:
             sign = "+" if t.net_pnl >= 0 else ""
-            print(f"  {str(t.entry_time)[:10]} {t.side:5s} → {t.exit_reason:15s}  {sign}${t.net_pnl:.2f}")
+            print(f"  {str(t.entry_time)[:10]} {t.side:5s} → {t.exit_reason:20s}  {sign}${t.net_pnl:.2f}")
 
     test_result.equity_curve.to_csv("equity_curve.csv")
     print(f"\n  ✅ Equity curve saved → equity_curve.csv")
+
+
+def cmd_analytics(args):
+    """Show per-setup and per-grade profitability from trade_history.csv."""
+    from pathlib import Path
+
+    history_path = Path("trade_history.csv")
+    if not history_path.exists():
+        print("\n❌ No trade_history.csv found. Run live trading first.")
+        return
+
+    df = pd.read_csv(history_path)
+    if df.empty:
+        print("\n❌ trade_history.csv is empty.")
+        return
+
+    print(f"\n{'='*65}")
+    print(f"  📊 PER-TRADE ANALYTICS")
+    print(f"{'='*65}")
+    print(f"  Total trades: {len(df)}")
+
+    if "pnl" in df.columns:
+        total_pnl = df["pnl"].sum()
+        wins = df[df["pnl"] > 0]
+        losses = df[df["pnl"] <= 0]
+        print(f"  Total PnL   : ${total_pnl:+.4f}")
+        print(f"  Win rate    : {len(wins)/len(df)*100:.1f}%  ({len(wins)}W / {len(losses)}L)")
+        if len(losses) > 0 and losses["pnl"].sum() != 0:
+            pf = abs(wins["pnl"].sum() / losses["pnl"].sum()) if len(losses) > 0 else 999
+            print(f"  Profit factor: {pf:.2f}")
+
+    # By setup type
+    if "setup_type" in df.columns and "pnl" in df.columns:
+        print(f"\n  ── By Setup Type ──────────────────────────────────")
+        print(f"  {'Setup':<22} {'Trades':>6} {'Win%':>6} {'Total PnL':>10} {'Avg PnL':>8}")
+        print(f"  {'-'*58}")
+        for setup, group in df.groupby("setup_type"):
+            n     = len(group)
+            wins  = (group["pnl"] > 0).sum()
+            wr    = wins / n * 100
+            total = group["pnl"].sum()
+            avg   = group["pnl"].mean()
+            arrow = "✅" if total > 0 else "❌"
+            print(f"  {arrow} {setup:<20} {n:>6} {wr:>5.1f}% {total:>+10.4f} {avg:>+8.4f}")
+
+    # By entry grade
+    if "entry_grade" in df.columns and "pnl" in df.columns:
+        print(f"\n  ── By Entry Grade ─────────────────────────────────")
+        print(f"  {'Grade':<8} {'Trades':>6} {'Win%':>6} {'Total PnL':>10} {'Avg PnL':>8}")
+        print(f"  {'-'*44}")
+        for grade in ["A", "B", "C", "D", "?"]:
+            group = df[df["entry_grade"] == grade]
+            if len(group) == 0:
+                continue
+            n     = len(group)
+            wins  = (group["pnl"] > 0).sum()
+            wr    = wins / n * 100
+            total = group["pnl"].sum()
+            avg   = group["pnl"].mean()
+            arrow = "✅" if total > 0 else "❌"
+            print(f"  {arrow} {grade:<6}   {n:>6} {wr:>5.1f}% {total:>+10.4f} {avg:>+8.4f}")
+
+    # By symbol
+    if "symbol" in df.columns and "pnl" in df.columns and df["symbol"].nunique() > 1:
+        print(f"\n  ── By Symbol ──────────────────────────────────────")
+        print(f"  {'Symbol':<12} {'Trades':>6} {'Win%':>6} {'Total PnL':>10}")
+        print(f"  {'-'*40}")
+        for sym, group in df.groupby("symbol"):
+            n    = len(group)
+            wins = (group["pnl"] > 0).sum()
+            wr   = wins / n * 100
+            total = group["pnl"].sum()
+            arrow = "✅" if total > 0 else "❌"
+            print(f"  {arrow} {sym:<10}   {n:>6} {wr:>5.1f}% {total:>+10.4f}")
+
+    # By exit reason
+    if "exit_reason" in df.columns and "pnl" in df.columns:
+        print(f"\n  ── By Exit Reason ─────────────────────────────────")
+        for reason, group in df.groupby("exit_reason"):
+            n    = len(group)
+            total = group["pnl"].sum()
+            avg  = group["pnl"].mean()
+            print(f"  {reason:<25} {n:>4} trades  total={total:>+8.4f}  avg={avg:>+7.4f}")
+
+    # Recommendation
+    print(f"\n  ── Recommendation ─────────────────────────────────")
+    if "entry_grade" in df.columns and "pnl" in df.columns:
+        grade_pnl = df.groupby("entry_grade")["pnl"].mean()
+        best_grade = grade_pnl.idxmax() if not grade_pnl.empty else "?"
+        worst_grade = grade_pnl.idxmin() if not grade_pnl.empty else "?"
+        print(f"  Best entry grade: {best_grade} (avg {grade_pnl.get(best_grade, 0):+.4f} per trade)")
+        if grade_pnl.get(worst_grade, 0) < 0:
+            print(f"  Consider raising min_confidence to filter out grade-{worst_grade} entries")
+    print(f"{'='*65}\n")
 
 
 async def cmd_status(args):
     key, secret = load_keys()
     if not key:
         return
-
     async with DeltaRESTClient(key, secret) as rest:
         balance   = await rest.get_wallet_balance("USDT")
         positions = await rest.get_positions()
         orders    = await rest.get_open_orders()
-
         print(f"\n{'='*55}")
         print(f"  📋 Account Status")
         print(f"{'='*55}")
@@ -251,11 +361,9 @@ async def cmd_info(args):
         product = await rest.get_product(args.symbol)
         ticker  = await rest.get_ticker(args.symbol)
         ob      = await rest.get_orderbook(args.symbol, depth=5)
-
         if not product:
             print(f"Symbol {args.symbol} not found")
             return
-
         print(f"\n{'='*55}")
         print(f"  {args.symbol} Product Info")
         print(f"{'='*55}")
@@ -271,8 +379,6 @@ async def cmd_info(args):
         print(f"  OI (USD)     : {ticker.open_interest:,.0f}")
         print(f"  OB Imbalance : {ob.imbalance():.3f} (>0=bullish)")
 
-
-# ─── Synthetic Data ────────────────────────────────────────────────────────────
 
 def _gen_synthetic(n: int = 3000, seed: int = 42) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
@@ -297,50 +403,65 @@ def _gen_synthetic(n: int = 3000, seed: int = 42) -> pd.DataFrame:
 
 def build_parser():
     p = argparse.ArgumentParser(
-        description="Delta Exchange Algo Bot — Institutional Confluence Strategy",
+        description="Delta Exchange Algo Bot V8 — Multi-coin + Analytics",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  python main.py trade --symbol ETH_USDT --capital 500 --leverage 5
-  python main.py trade --symbol BTC_USDT --capital 1000 --leverage 3 --resolution 60
-  python main.py backtest --symbol BTC_USDT --capital 10000
-  python main.py status
-  python main.py info --symbol BTC_USDT
+Multi-coin setup (each in separate terminal):
+  python main.py trade --symbol BTCUSD --capital 30 --leverage 3
+  python main.py trade --symbol ETHUSD --capital 30 --leverage 3
+  python main.py trade --symbol SOLUSD --capital 30 --leverage 3
+
+Single coin (all capital):
+  python main.py trade --symbol BTCUSD --capital 90 --leverage 3
+
+1H candles (less noise, recommended for small capital):
+  python main.py trade --symbol BTCUSD --capital 90 --leverage 3 --resolution 60
+
+Analytics (after trades have run):
+  python main.py analytics
+
+Backtest:
+  python main.py backtest --symbol BTCUSD --capital 10000
         """,
     )
     sub = p.add_subparsers(dest="command", required=True)
 
     # trade
     t = sub.add_parser("trade", help="Run live trading bot")
-    t.add_argument("--symbol",           default="ETH_USDT")
-    t.add_argument("--capital",          type=float, default=100.0, help="Starting capital in USDT")
-    t.add_argument("--leverage",         type=int,   default=5,     help="Leverage (recommended: 3-10)")
-    t.add_argument("--resolution",       type=int,   default=15,    help="Candle timeframe in minutes")
-    t.add_argument("--risk-per-trade",   type=float, default=0.01,  dest="risk_per_trade", help="Risk per trade (0.01=1%%)")
-    t.add_argument("--max-drawdown",     type=float, default=0.15,  dest="max_drawdown",   help="Max drawdown to halt (0.15=15%%)")
+    t.add_argument("--symbol",           default="ETHUSD")
+    t.add_argument("--capital",          type=float, default=30.0,
+                   help="This bot's allocated capital slice (NOT total account)")
+    t.add_argument("--leverage",         type=int,   default=3)
+    t.add_argument("--resolution",       type=int,   default=15,
+                   help="Candle timeframe in minutes (15 or 60 recommended)")
+    t.add_argument("--risk-per-trade",   type=float, default=0.01,  dest="risk_per_trade")
+    t.add_argument("--max-drawdown",     type=float, default=0.15,  dest="max_drawdown")
     t.add_argument("--daily-loss-limit", type=float, default=0.08,  dest="daily_loss_limit")
-    t.add_argument("--min-confidence",   type=float, default=0.50,  dest="min_confidence")
-    t.add_argument("--adx-threshold",    type=float, default=18.0,  dest="adx_threshold")
-    t.add_argument("--vol-factor",       type=float, default=1.05,  dest="vol_factor")
-    t.add_argument("--sl-atr-mult",      type=float, default=1.2,   dest="sl_atr_mult")
-    t.add_argument("--tp-rr",            type=float, default=2.0,   dest="tp_rr",         help="Risk-reward ratio for TP")
+    t.add_argument("--min-confidence",   type=float, default=0.58,  dest="min_confidence")
+    t.add_argument("--adx-threshold",    type=float, default=20.0,  dest="adx_threshold")
+    t.add_argument("--vol-factor",       type=float, default=1.1,   dest="vol_factor")
+    t.add_argument("--sl-atr-mult",      type=float, default=1.5,   dest="sl_atr_mult")
+    t.add_argument("--tp-rr",            type=float, default=2.2,   dest="tp_rr")
     t.add_argument("--fast-ema",         type=int,   default=9,     dest="fast_ema")
     t.add_argument("--mid-ema",          type=int,   default=21,    dest="mid_ema")
     t.add_argument("--slow-ema",         type=int,   default=50,    dest="slow_ema")
 
     # backtest
-    b = sub.add_parser("backtest", help="Run backtest on historical or synthetic data")
-    b.add_argument("--symbol",    default="BTC_USDT")
+    b = sub.add_parser("backtest", help="Backtest on historical or synthetic data")
+    b.add_argument("--symbol",    default="BTCUSD")
     b.add_argument("--capital",   type=float, default=10_000.0)
-    b.add_argument("--leverage",  type=float, default=5.0)
-    b.add_argument("--data-file", default=None, dest="data_file", help="Path to CSV (OHLCV) data")
+    b.add_argument("--leverage",  type=float, default=3.0)
+    b.add_argument("--data-file", default=None, dest="data_file")
+
+    # analytics (new in V8)
+    sub.add_parser("analytics", help="Show per-setup and per-grade profitability")
 
     # status
     sub.add_parser("status", help="Show account status, positions, orders")
 
     # info
     i = sub.add_parser("info", help="Show product info and ticker")
-    i.add_argument("--symbol", default="ETH_USDT")
+    i.add_argument("--symbol", default="ETHUSD")
 
     return p
 
@@ -351,6 +472,8 @@ if __name__ == "__main__":
         asyncio.run(cmd_trade(args))
     elif args.command == "backtest":
         cmd_backtest(args)
+    elif args.command == "analytics":
+        cmd_analytics(args)
     elif args.command == "status":
         asyncio.run(cmd_status(args))
     elif args.command == "info":
