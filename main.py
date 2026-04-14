@@ -49,14 +49,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
-from api import DeltaRESTClient
-from backtest import Backtester, BacktestConfig
 from delta_bot.config import StorageConfig
-from delta_bot.runtime import build_audit_store, build_portfolio_risk_manager
-from execution import ExecutionEngine
-from risk import RiskConfig, RiskManager
-from strategy import ConfluenceStrategy, load_strategy
-
+from delta_bot.orchestrator import build_risk_config_from_args, build_strategy_from_args, run_multi_symbol
 
 def load_keys():
     key    = os.getenv("DELTA_API_KEY", "").strip()
@@ -69,51 +63,17 @@ def load_keys():
 # ─── Commands ─────────────────────────────────────────────────────────────────
 
 async def cmd_trade(args):
+    from api import DeltaRESTClient
+    from delta_bot.runtime import build_audit_store, build_portfolio_risk_manager
+    from execution import ExecutionEngine
+    from risk import RiskManager
+
     key, secret = load_keys()
     if not key:
         return
 
-    strategy = ConfluenceStrategy({
-        "fast_ema":      args.fast_ema,
-        "mid_ema":       args.mid_ema,
-        "slow_ema":      args.slow_ema,
-        "trend_ema":     200,
-        "rsi_period":    14,
-        "atr_period":    14,
-        "adx_threshold": args.adx_threshold,
-        "vol_factor":    args.vol_factor,
-        # V8 RSI zones (unchanged from V7 — correct)
-        "rsi_long_min":  35,
-        "rsi_long_max":  52,
-        "rsi_short_min": 48,
-        "rsi_short_max": 65,
-        # V8: dip-buying parameters
-        "ema_touch_lookback":   3,     # bars to look back for EMA21 touch
-        "extension_atr_mult":  1.5,   # block if price > 1.5×ATR from EMA21
-        "max_ema_distance_pct": 0.03,  # max 3% from EMA21 for entry
-        "funding_long_max":  0.015,
-        "funding_short_min": -0.015,
-        "sl_atr_mult":  args.sl_atr_mult,
-        "tp_rr":        args.tp_rr,
-        "swing_lookback": 5,
-        "bb_std":        2.0,
-    })
-
-    risk_cfg = RiskConfig(
-        risk_per_trade        = args.risk_per_trade,
-        max_open_trades       = 3,
-        max_drawdown_pct      = args.max_drawdown,
-        daily_loss_limit_pct  = args.daily_loss_limit,
-        leverage              = float(args.leverage),
-        max_position_size_pct = 0.25,
-        # V7 trailing (correct — keep unchanged)
-        breakeven_trigger_pct   = 0.010,
-        breakeven_buffer_pct    = 0.002,
-        profit_lock_trigger_pct = 0.018,
-        profit_lock_trail_pct   = 0.008,
-        min_confidence          = args.min_confidence,
-    )
-    risk_cfg.leverage_by_symbol[args.symbol] = float(args.leverage)
+    strategy = build_strategy_from_args(args)
+    risk_cfg = build_risk_config_from_args(args, args.symbol)
 
     # V8: risk manager is initialised with the ALLOCATED capital slice
     # This means each bot's drawdown/risk is calculated from its own slice,
@@ -204,7 +164,17 @@ async def cmd_trade(args):
             logger.info("Bot stopped by user.")
 
 
+async def cmd_trade_portfolio(args):
+    key, secret = load_keys()
+    if not key:
+        return
+    await run_multi_symbol(args, key, secret, logger)
+
+
 def cmd_backtest(args):
+    from backtest import Backtester, BacktestConfig
+    from strategy import ConfluenceStrategy
+
     print(f"\n{'='*65}")
     print(f"  📊 BACKTEST V8: {args.symbol}")
     print(f"{'='*65}")
@@ -346,6 +316,8 @@ def cmd_analytics(args):
 
 
 async def cmd_status(args):
+    from api import DeltaRESTClient
+
     key, secret = load_keys()
     if not key:
         return
@@ -373,6 +345,8 @@ async def cmd_status(args):
 
 
 async def cmd_info(args):
+    from api import DeltaRESTClient
+
     key, secret = load_keys()
     async with DeltaRESTClient(key, secret) as rest:
         product = await rest.get_product(args.symbol)
@@ -437,6 +411,9 @@ Multi-coin setup (each in separate terminal):
   python main.py trade --symbol ETHUSD --capital 30 --leverage 3
   python main.py trade --symbol SOLUSD --capital 30 --leverage 3
 
+Shared-portfolio multi-symbol runtime:
+  python main.py trade-portfolio --symbols BTCUSD,ETHUSD,SOLUSD --capital 90 --leverage 3
+
 Single coin (all capital):
   python main.py trade --symbol BTCUSD --capital 90 --leverage 3
 
@@ -472,6 +449,26 @@ Backtest:
     t.add_argument("--mid-ema",          type=int,   default=21,    dest="mid_ema")
     t.add_argument("--slow-ema",         type=int,   default=50,    dest="slow_ema")
 
+    tp = sub.add_parser("trade-portfolio", help="Run one shared-portfolio process across multiple symbols")
+    tp.add_argument("--symbols",          default="BTCUSD,ETHUSD,SOLUSD",
+                    help="Comma-separated symbol list, e.g. BTCUSD,ETHUSD,SOLUSD")
+    tp.add_argument("--capital",          type=float, default=90.0,
+                    help="Shared portfolio capital across all symbols in this process")
+    tp.add_argument("--leverage",         type=int,   default=3)
+    tp.add_argument("--resolution",       type=int,   default=15,
+                    help="Candle timeframe in minutes (15 or 60 recommended)")
+    tp.add_argument("--risk-per-trade",   type=float, default=0.01,  dest="risk_per_trade")
+    tp.add_argument("--max-drawdown",     type=float, default=0.15,  dest="max_drawdown")
+    tp.add_argument("--daily-loss-limit", type=float, default=0.08,  dest="daily_loss_limit")
+    tp.add_argument("--min-confidence",   type=float, default=0.58,  dest="min_confidence")
+    tp.add_argument("--adx-threshold",    type=float, default=20.0,  dest="adx_threshold")
+    tp.add_argument("--vol-factor",       type=float, default=1.1,   dest="vol_factor")
+    tp.add_argument("--sl-atr-mult",      type=float, default=1.5,   dest="sl_atr_mult")
+    tp.add_argument("--tp-rr",            type=float, default=2.2,   dest="tp_rr")
+    tp.add_argument("--fast-ema",         type=int,   default=9,     dest="fast_ema")
+    tp.add_argument("--mid-ema",          type=int,   default=21,    dest="mid_ema")
+    tp.add_argument("--slow-ema",         type=int,   default=50,    dest="slow_ema")
+
     # backtest
     b = sub.add_parser("backtest", help="Backtest on historical or synthetic data")
     b.add_argument("--symbol",    default="BTCUSD")
@@ -501,6 +498,8 @@ if __name__ == "__main__":
     args = build_parser().parse_args()
     if args.command == "trade":
         asyncio.run(cmd_trade(args))
+    elif args.command == "trade-portfolio":
+        asyncio.run(cmd_trade_portfolio(args))
     elif args.command == "backtest":
         cmd_backtest(args)
     elif args.command == "analytics":
