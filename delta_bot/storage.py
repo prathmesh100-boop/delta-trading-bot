@@ -29,84 +29,101 @@ class AuditStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=MEMORY;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
         try:
             yield conn
             conn.commit()
         finally:
             conn.close()
 
+    def _clear_stale_journal(self) -> None:
+        journal_path = self.db_path.with_name(f"{self.db_path.name}-journal")
+        if journal_path.exists():
+            try:
+                journal_path.unlink()
+            except PermissionError:
+                pass
+
     def _init_db(self) -> None:
-        with self._connect() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS audit_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_time TEXT NOT NULL,
-                    category TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    symbol TEXT,
-                    severity TEXT,
-                    payload_json TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_audit_events_time ON audit_events(event_time DESC);
-                CREATE INDEX IF NOT EXISTS idx_audit_events_category ON audit_events(category, event_time DESC);
+        schema = """
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_time TEXT NOT NULL,
+                category TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                symbol TEXT,
+                severity TEXT,
+                payload_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_events_time ON audit_events(event_time DESC);
+            CREATE INDEX IF NOT EXISTS idx_audit_events_category ON audit_events(category, event_time DESC);
 
-                CREATE TABLE IF NOT EXISTS trade_audit (
-                    trade_id TEXT PRIMARY KEY,
-                    symbol TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    side TEXT,
-                    entry_time TEXT,
-                    exit_time TEXT,
-                    entry_price REAL,
-                    exit_price REAL,
-                    stop_loss REAL,
-                    take_profit REAL,
-                    size INTEGER,
-                    contract_value REAL,
-                    notional_usd REAL,
-                    pnl REAL,
-                    reason TEXT,
-                    setup_type TEXT,
-                    entry_grade TEXT,
-                    quality_score REAL,
-                    regime TEXT,
-                    htf TEXT,
-                    rsi REAL,
-                    adx REAL,
-                    raw_json TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_trade_audit_symbol ON trade_audit(symbol, updated_at DESC);
+            CREATE TABLE IF NOT EXISTS trade_audit (
+                trade_id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                status TEXT NOT NULL,
+                side TEXT,
+                entry_time TEXT,
+                exit_time TEXT,
+                entry_price REAL,
+                exit_price REAL,
+                stop_loss REAL,
+                take_profit REAL,
+                size INTEGER,
+                contract_value REAL,
+                notional_usd REAL,
+                pnl REAL,
+                reason TEXT,
+                setup_type TEXT,
+                entry_grade TEXT,
+                quality_score REAL,
+                regime TEXT,
+                htf TEXT,
+                rsi REAL,
+                adx REAL,
+                raw_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_trade_audit_symbol ON trade_audit(symbol, updated_at DESC);
 
-                CREATE TABLE IF NOT EXISTS runtime_state (
-                    namespace TEXT NOT NULL,
-                    state_key TEXT NOT NULL,
-                    value_json TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY(namespace, state_key)
-                );
+            CREATE TABLE IF NOT EXISTS runtime_state (
+                namespace TEXT NOT NULL,
+                state_key TEXT NOT NULL,
+                value_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(namespace, state_key)
+            );
 
-                CREATE TABLE IF NOT EXISTS portfolio_snapshots (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    snapshot_time TEXT NOT NULL,
-                    equity REAL NOT NULL,
-                    capital REAL NOT NULL,
-                    peak_equity REAL NOT NULL,
-                    daily_start_equity REAL NOT NULL,
-                    drawdown_pct REAL NOT NULL,
-                    daily_loss_pct REAL NOT NULL,
-                    open_positions INTEGER NOT NULL,
-                    open_notional_usd REAL NOT NULL,
-                    open_risk_usd REAL NOT NULL,
-                    kill_switch INTEGER NOT NULL,
-                    payload_json TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_time ON portfolio_snapshots(snapshot_time DESC);
-                """
-            )
+            CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_time TEXT NOT NULL,
+                equity REAL NOT NULL,
+                capital REAL NOT NULL,
+                peak_equity REAL NOT NULL,
+                daily_start_equity REAL NOT NULL,
+                drawdown_pct REAL NOT NULL,
+                daily_loss_pct REAL NOT NULL,
+                open_positions INTEGER NOT NULL,
+                open_notional_usd REAL NOT NULL,
+                open_risk_usd REAL NOT NULL,
+                kill_switch INTEGER NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_time ON portfolio_snapshots(snapshot_time DESC);
+        """
+        for attempt in range(2):
+            try:
+                with self._connect() as conn:
+                    conn.executescript(schema)
+                return
+            except sqlite3.OperationalError:
+                if attempt == 0:
+                    self._clear_stale_journal()
+                    continue
+                raise
 
     def _dump(self, payload: Any) -> str:
         return json.dumps(payload, default=_json_default, sort_keys=True)
@@ -252,6 +269,14 @@ class AuditStore:
             ).fetchone()
         return json.loads(row["payload_json"]) if row else None
 
+    def recent_portfolio_snapshots(self, limit: int = 200) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM portfolio_snapshots ORDER BY snapshot_time DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [json.loads(row["payload_json"]) for row in reversed(rows)]
+
     def recent_events(self, limit: int = 200, category: Optional[str] = None) -> List[Dict[str, Any]]:
         query = "SELECT event_time, category, event_type, symbol, severity, payload_json FROM audit_events"
         params: List[Any] = []
@@ -288,4 +313,3 @@ class AuditStore:
             payload["updated_at"] = row["updated_at"]
             items.append(payload)
         return items
-

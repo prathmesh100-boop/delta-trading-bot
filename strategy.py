@@ -52,6 +52,53 @@ class Signal:
     metadata:    Dict  = field(default_factory=dict)
 
 
+@dataclass
+class StrategyCandidate:
+    signal_type: SignalType
+    setup_type: str
+    regime: str
+    confidence: float
+    stop_loss: float
+    take_profit: Optional[float]
+    score: float
+    metadata: Dict = field(default_factory=dict)
+
+
+def normalize_signal(signal: Optional[Signal]) -> Optional[Signal]:
+    """Normalize signal payload so backtest/live paths consume the same shape."""
+    if signal is None:
+        return None
+    metadata = dict(signal.metadata or {})
+    metadata.setdefault("setup_type", "unknown")
+    metadata.setdefault("regime", "unknown")
+    metadata.setdefault("entry_quality", {})
+    metadata.setdefault("strategy_family", "confluence")
+    metadata.setdefault("consistency_key", signal_fingerprint(signal))
+    return Signal(
+        type=signal.type,
+        symbol=signal.symbol,
+        price=round(float(signal.price), 6) if signal.price is not None else None,
+        stop_loss=round(float(signal.stop_loss), 6) if signal.stop_loss is not None else None,
+        take_profit=round(float(signal.take_profit), 6) if signal.take_profit is not None else None,
+        confidence=round(float(signal.confidence), 4),
+        metadata=metadata,
+    )
+
+
+def signal_fingerprint(signal: Signal) -> str:
+    return "|".join(
+        [
+            str(signal.type.value),
+            str(signal.symbol or ""),
+            f"{float(signal.stop_loss or 0.0):.6f}",
+            f"{float(signal.take_profit or 0.0):.6f}" if signal.take_profit is not None else "none",
+            f"{float(signal.confidence):.4f}",
+            str((signal.metadata or {}).get("setup_type", "unknown")),
+            str((signal.metadata or {}).get("regime", "unknown")),
+        ]
+    )
+
+
 class BaseStrategy:
     def __init__(self, params=None):
         self.params = params or {}
@@ -354,7 +401,7 @@ class ConfluenceStrategy:
         self, df: pd.DataFrame, symbol: str = "", funding_rate: float = 0.0
     ) -> Optional[Signal]:
         if len(df) < 210:
-            return Signal(SignalType.NEUTRAL, confidence=0.0)
+            return normalize_signal(Signal(SignalType.NEUTRAL, confidence=0.0))
 
         close = df["close"]
         price = float(close.iloc[-1])
@@ -406,22 +453,47 @@ class ConfluenceStrategy:
         prev_swing_high = float(df["high"].iloc[high_idxs[-2]]) if len(high_idxs) >= 2 else None
         prev_bar = df.iloc[-2] if len(df) >= 2 else None
 
-        if regime == "trend":
-            return self._trend_signal(
-                df, price, htf, curr_ema21, curr_ema50, curr_ema200,
-                curr_rsi, curr_atr, curr_adx, plus_di, minus_di,
-                curr_macd_h, prev_macd_h, vol_ok, vol_alive,
-                last_swing_low, last_swing_high,
-                funding_extreme_long, funding_extreme_short,
-                prev_swing_low, prev_swing_high, prev_bar,
-                curr_open, prev_close, symbol, ema21_s,
+        candidates: List[StrategyCandidate] = []
+        blockers: List[str] = []
+
+        trend_result = self._trend_signal(
+            df, price, htf, curr_ema21, curr_ema50, curr_ema200,
+            curr_rsi, curr_atr, curr_adx, plus_di, minus_di,
+            curr_macd_h, prev_macd_h, vol_ok, vol_alive,
+            last_swing_low, last_swing_high,
+            funding_extreme_long, funding_extreme_short,
+            prev_swing_low, prev_swing_high, prev_bar,
+            curr_open, prev_close, symbol, ema21_s,
+        )
+        if isinstance(trend_result, StrategyCandidate):
+            candidates.append(trend_result)
+        elif isinstance(trend_result, Signal):
+            blockers.extend((trend_result.metadata or {}).get("blockers", []))
+
+        range_result = self._range_signal(
+            df, price, htf, curr_rsi, curr_atr, vol_ok,
+            last_swing_low, last_swing_high, curr_open, prev_close,
+            symbol, ema21_s,
+        )
+        if isinstance(range_result, StrategyCandidate):
+            candidates.append(range_result)
+        elif isinstance(range_result, Signal):
+            blockers.extend((range_result.metadata or {}).get("blockers", []))
+
+        selected = self._select_candidate(candidates, regime)
+        if selected is not None:
+            return normalize_signal(self._candidate_to_signal(selected, symbol=symbol, price=price, htf=htf))
+
+        return normalize_signal(
+            self._neutral_signal(
+                regime,
+                htf=htf,
+                rsi=round(curr_rsi, 1),
+                adx=round(curr_adx, 1),
+                blockers=sorted(set(blockers)),
+                strategy_family="confluence_selector",
             )
-        else:
-            return self._range_signal(
-                df, price, htf, curr_rsi, curr_atr, vol_ok,
-                last_swing_low, last_swing_high, curr_open, prev_close,
-                symbol, ema21_s,
-            )
+        )
 
     # ── Trend Signal ──────────────────────────────────────────────────────────
 
@@ -434,7 +506,7 @@ class ConfluenceStrategy:
         funding_extreme_long, funding_extreme_short,
         prev_swing_low, prev_swing_high, prev_bar,
         curr_open, prev_close, symbol, ema21_series,
-    ) -> Signal:
+    ) -> Signal | StrategyCandidate:
 
         # Liquidity sweep detection
         sweep_long = reclaim_long = bos_long = False
@@ -533,10 +605,20 @@ class ConfluenceStrategy:
                 setup_type, price, sl, tp, confidence, curr_adx, curr_rsi,
                 quality["grade"], quality["pullback_depth_pct"],
             )
-            return Signal(
-                type=SignalType.LONG, symbol=symbol, price=price,
-                stop_loss=round(sl, 4), take_profit=round(tp, 4),
+            return StrategyCandidate(
+                signal_type=SignalType.LONG,
+                setup_type=setup_type,
+                regime="trend",
                 confidence=confidence,
+                stop_loss=round(sl, 4),
+                take_profit=round(tp, 4),
+                score=self._candidate_score(
+                    confidence=confidence,
+                    setup_type=setup_type,
+                    regime="trend",
+                    quality_score=quality["overall"],
+                    trigger_bonus=self._trigger_bonus(entry_trigger_long, sweep_long, reclaim_long, bos_long),
+                ),
                 metadata={
                     "regime": "trend", "htf": htf, "setup_type": setup_type,
                     "ema21": round(ema21, 4), "adx": round(curr_adx, 1),
@@ -545,6 +627,7 @@ class ConfluenceStrategy:
                     "entry_quality": quality,
                     "touched_ema21": touched_long,
                     "ema_depth_pct": quality["pullback_depth_pct"],
+                    "candidate_origin": "trend_signal",
                 },
             )
 
@@ -568,10 +651,20 @@ class ConfluenceStrategy:
                 setup_type, price, sl, tp, confidence, curr_adx, curr_rsi,
                 quality["grade"], quality["pullback_depth_pct"],
             )
-            return Signal(
-                type=SignalType.SHORT, symbol=symbol, price=price,
-                stop_loss=round(sl, 4), take_profit=round(tp, 4),
+            return StrategyCandidate(
+                signal_type=SignalType.SHORT,
+                setup_type=setup_type,
+                regime="trend",
                 confidence=confidence,
+                stop_loss=round(sl, 4),
+                take_profit=round(tp, 4),
+                score=self._candidate_score(
+                    confidence=confidence,
+                    setup_type=setup_type,
+                    regime="trend",
+                    quality_score=quality["overall"],
+                    trigger_bonus=self._trigger_bonus(entry_trigger_short, sweep_short, reclaim_short, bos_short),
+                ),
                 metadata={
                     "regime": "trend", "htf": htf, "setup_type": setup_type,
                     "ema21": round(ema21, 4), "adx": round(curr_adx, 1),
@@ -580,6 +673,7 @@ class ConfluenceStrategy:
                     "entry_quality": quality,
                     "touched_ema21": touched_short,
                     "ema_depth_pct": quality["pullback_depth_pct"],
+                    "candidate_origin": "trend_signal",
                 },
             )
 
@@ -605,7 +699,7 @@ class ConfluenceStrategy:
         self, df, price, htf, curr_rsi, curr_atr, vol_ok,
         last_swing_low, last_swing_high, curr_open, prev_close,
         symbol, ema21_series,
-    ) -> Signal:
+    ) -> Signal | StrategyCandidate:
         close = df["close"]
         mid   = close.rolling(self.bb_period).mean()
         std   = close.rolling(self.bb_period).std()
@@ -635,14 +729,25 @@ class ConfluenceStrategy:
                 quality = score_entry_quality(curr_rsi, 15, 50, 30, -0.001, vol_ok, bb_excess, True, "long")
                 logger.info("✅ RANGE LONG | price=%.4f sl=%.4f tp=%.4f rsi=%.1f grade=%s",
                             price, sl, tp, curr_rsi, quality["grade"])
-                return Signal(
-                    type=SignalType.LONG, symbol=symbol, price=price,
-                    stop_loss=round(sl, 4), take_profit=round(tp, 4),
+                return StrategyCandidate(
+                    signal_type=SignalType.LONG,
+                    setup_type="range_mean_rev",
+                    regime="range",
                     confidence=confidence,
+                    stop_loss=round(sl, 4),
+                    take_profit=round(tp, 4),
+                    score=self._candidate_score(
+                        confidence=confidence,
+                        setup_type="range_mean_rev",
+                        regime="range",
+                        quality_score=quality["overall"],
+                        trigger_bonus=bb_excess * 0.05,
+                    ),
                     metadata={
                         "regime": "range", "htf": htf, "setup_type": "range_mean_rev",
                         "bb_lower": round(lower, 4), "bb_mid": round(mid_v, 4),
                         "rsi": round(curr_rsi, 1), "entry_quality": quality,
+                        "candidate_origin": "range_signal",
                     },
                 )
 
@@ -662,14 +767,25 @@ class ConfluenceStrategy:
                 quality = score_entry_quality(curr_rsi, 15, 30, 50, 0.001, vol_ok, bb_excess, True, "short")
                 logger.info("✅ RANGE SHORT | price=%.4f sl=%.4f tp=%.4f rsi=%.1f grade=%s",
                             price, sl, tp, curr_rsi, quality["grade"])
-                return Signal(
-                    type=SignalType.SHORT, symbol=symbol, price=price,
-                    stop_loss=round(sl, 4), take_profit=round(tp, 4),
+                return StrategyCandidate(
+                    signal_type=SignalType.SHORT,
+                    setup_type="range_mean_rev",
+                    regime="range",
                     confidence=confidence,
+                    stop_loss=round(sl, 4),
+                    take_profit=round(tp, 4),
+                    score=self._candidate_score(
+                        confidence=confidence,
+                        setup_type="range_mean_rev",
+                        regime="range",
+                        quality_score=quality["overall"],
+                        trigger_bonus=bb_excess * 0.05,
+                    ),
                     metadata={
                         "regime": "range", "htf": htf, "setup_type": "range_mean_rev",
                         "bb_upper": round(upper, 4), "bb_mid": round(mid_v, 4),
                         "rsi": round(curr_rsi, 1), "entry_quality": quality,
+                        "candidate_origin": "range_signal",
                     },
                 )
 
@@ -695,6 +811,50 @@ class ConfluenceStrategy:
         # C-grade (50–64) → 0.50–0.61
         # D-grade (<50) → 0.35–0.49
         return round(min(0.95, max(0.35, overall_score / 100 * 0.95)), 3)
+
+    def _candidate_score(
+        self,
+        *,
+        confidence: float,
+        setup_type: str,
+        regime: str,
+        quality_score: float,
+        trigger_bonus: float = 0.0,
+    ) -> float:
+        regime_bonus = 0.12 if setup_type == "range_mean_rev" and regime == "range" else 0.12 if setup_type != "range_mean_rev" and regime == "trend" else -0.08
+        setup_bonus = 0.10 if setup_type == "structure_break" else 0.06 if setup_type == "trend_pullback" else 0.04
+        return round(confidence + quality_score / 1000.0 + trigger_bonus + regime_bonus + setup_bonus, 4)
+
+    def _select_candidate(self, candidates: List[StrategyCandidate], regime: str) -> Optional[StrategyCandidate]:
+        if not candidates:
+            return None
+        ranked = sorted(
+            candidates,
+            key=lambda candidate: (
+                candidate.score + (0.08 if candidate.regime == regime else -0.05),
+                candidate.confidence,
+            ),
+            reverse=True,
+        )
+        return ranked[0]
+
+    def _candidate_to_signal(self, candidate: StrategyCandidate, symbol: str, price: float, htf: str) -> Signal:
+        metadata = dict(candidate.metadata or {})
+        metadata.setdefault("setup_type", candidate.setup_type)
+        metadata.setdefault("regime", candidate.regime)
+        metadata.setdefault("htf", htf)
+        metadata["strategy_family"] = "confluence_selector"
+        metadata["candidate_score"] = candidate.score
+        metadata["selection_reason"] = f"{candidate.setup_type}:{candidate.regime}:{candidate.score:.4f}"
+        return Signal(
+            type=candidate.signal_type,
+            symbol=symbol,
+            price=price,
+            stop_loss=candidate.stop_loss,
+            take_profit=candidate.take_profit,
+            confidence=candidate.confidence,
+            metadata=metadata,
+        )
 
     def _trigger_bonus(self, entry_trigger, sweep, reclaim, bos) -> float:
         if entry_trigger: return 0.20
@@ -731,4 +891,4 @@ def load_strategy(name: str = "confluence", params: Optional[Dict] = None) -> Co
     return STRATEGY_MAP.get(name, ConfluenceStrategy)(params)
 
 __all__ = ["ConfluenceStrategy", "Signal", "SignalType", "load_strategy", "STRATEGY_MAP",
-           "score_entry_quality"]
+           "score_entry_quality", "StrategyCandidate", "normalize_signal", "signal_fingerprint"]

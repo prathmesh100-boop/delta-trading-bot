@@ -34,7 +34,7 @@ from delta_bot.portfolio import PortfolioRiskManager
 from delta_bot.storage import AuditStore
 from risk import RiskManager, TradeRecord
 from state_store import StateStore
-from strategy import ConfluenceStrategy, Signal, SignalType
+from strategy import ConfluenceStrategy, Signal, SignalType, normalize_signal
 
 logger = logging.getLogger(__name__)
 
@@ -425,7 +425,7 @@ class ExecutionEngine:
         df = df[df.index <= pd.to_datetime(closed_candle_ts, unit="s", utc=True)]
 
         try:
-            signal = self.strategy.generate_signal(df, self.symbol, self._funding)
+            signal = normalize_signal(self.strategy.generate_signal(df, self.symbol, self._funding))
         except Exception as exc:
             logger.error("Strategy error: %s", exc, exc_info=True)
             return

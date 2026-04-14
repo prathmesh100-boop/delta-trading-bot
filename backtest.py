@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from strategy import ConfluenceStrategy, Signal, SignalType
+from strategy import ConfluenceStrategy, Signal, SignalType, normalize_signal
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +168,7 @@ class Backtester:
             # Generate new signal
             if current_trade is None:
                 try:
-                    sig = strategy.generate_signal(window, symbol)
+                    sig = normalize_signal(strategy.generate_signal(window, symbol))
                 except Exception as exc:
                     logger.debug("Strategy error at bar %d: %s", i, exc)
                     sig = None
