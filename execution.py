@@ -481,11 +481,6 @@ class ExecutionEngine:
             logger.debug("Trade already open — skipping")
             return
 
-        if signal.confidence < self.min_confidence:
-            self._last_signal_candle_ts = closed_candle_ts
-            logger.info("Confidence %.2f < %.2f — skipping", signal.confidence, self.min_confidence)
-            return
-
         if not signal.stop_loss or signal.stop_loss <= 0:
             self._last_signal_candle_ts = closed_candle_ts
             logger.warning("Signal has no valid SL — skipping")

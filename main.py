@@ -225,6 +225,101 @@ def cmd_analytics(args):
     """Show per-setup and per-grade profitability from trade_history.csv."""
     from pathlib import Path
 
+    def _safe_label(value, fallback: str = "unknown") -> str:
+        if pd.isna(value):
+            return fallback
+        text = str(value).strip()
+        return text if text else fallback
+
+    def _expectancy_stats(group: pd.DataFrame) -> dict:
+        pnl = group["pnl"].astype(float)
+        wins = pnl[pnl > 0]
+        losses = pnl[pnl <= 0]
+        win_rate = len(wins) / len(pnl) if len(pnl) else 0.0
+        loss_rate = len(losses) / len(pnl) if len(pnl) else 0.0
+        avg_win = wins.mean() if len(wins) else 0.0
+        avg_loss_abs = abs(losses.mean()) if len(losses) else 0.0
+        expectancy = avg_win * win_rate - avg_loss_abs * loss_rate
+        return {
+            "trades": len(group),
+            "win_rate": win_rate,
+            "total_pnl": pnl.sum(),
+            "avg_pnl": pnl.mean() if len(pnl) else 0.0,
+            "avg_win": avg_win,
+            "avg_loss": -avg_loss_abs,
+            "expectancy": expectancy,
+        }
+
+    def _print_expectancy_table(df: pd.DataFrame, group_col: str, title: str, width: int = 18) -> None:
+        if group_col not in df.columns or "pnl" not in df.columns:
+            return
+
+        working = df[[group_col, "pnl"]].copy()
+        working[group_col] = working[group_col].apply(_safe_label)
+
+        rows = []
+        for label, group in working.groupby(group_col):
+            stats = _expectancy_stats(group)
+            rows.append((label, stats))
+
+        if not rows:
+            return
+
+        rows.sort(key=lambda item: (item[1]["expectancy"], item[1]["total_pnl"]), reverse=True)
+        print(f"\n  {title}")
+        print(f"  {'Group':<{width}} {'Trades':>6} {'Win%':>6} {'Exp':>9} {'AvgWin':>9} {'AvgLoss':>9} {'Total':>10}")
+        print(f"  {'-' * (width + 52)}")
+        for label, stats in rows:
+            marker = "✅" if stats["expectancy"] > 0 else "❌"
+            print(
+                f"  {marker} {label:<{width-2}} {stats['trades']:>6} "
+                f"{stats['win_rate']*100:>5.1f}% {stats['expectancy']:>+9.4f} "
+                f"{stats['avg_win']:>+9.4f} {stats['avg_loss']:>+9.4f} {stats['total_pnl']:>+10.4f}"
+            )
+
+    def _recommendations(df: pd.DataFrame) -> list[str]:
+        recs: list[str] = []
+        if "pnl" not in df.columns:
+            return recs
+
+        if "setup_type" in df.columns:
+            setup_stats = df.groupby("setup_type")["pnl"].agg(["count", "mean", "sum"])
+            for setup, row in setup_stats.sort_values("mean").iterrows():
+                label = _safe_label(setup)
+                if int(row["count"]) >= 5 and float(row["mean"]) < 0:
+                    recs.append(
+                        f"{label} expectancy is negative over {int(row['count'])} trades; consider disabling or tightening it."
+                    )
+
+        if "entry_grade" in df.columns:
+            grade_stats = df.groupby("entry_grade")["pnl"].agg(["count", "mean"])
+            for grade, row in grade_stats.sort_values("mean").iterrows():
+                label = _safe_label(grade, "?")
+                if int(row["count"]) >= 5 and float(row["mean"]) < 0:
+                    recs.append(
+                        f"Grade {label} averages negative PnL over {int(row['count'])} trades; consider filtering it out."
+                    )
+
+        if "regime" in df.columns:
+            regime_stats = df.groupby("regime")["pnl"].agg(["count", "mean"])
+            for regime, row in regime_stats.sort_values("mean").iterrows():
+                label = _safe_label(regime)
+                if int(row["count"]) >= 5 and float(row["mean"]) < 0:
+                    recs.append(
+                        f"{label} regime underperforms over {int(row['count'])} trades; treat it as a risk-on filter, not a default."
+                    )
+
+        if "symbol" in df.columns:
+            symbol_stats = df.groupby("symbol")["pnl"].agg(["count", "mean"])
+            for symbol, row in symbol_stats.sort_values("mean").iterrows():
+                label = _safe_label(symbol)
+                if int(row["count"]) >= 5 and float(row["mean"]) < 0:
+                    recs.append(
+                        f"{label} is negative over {int(row['count'])} trades; reduce focus there before expanding symbol count."
+                    )
+
+        return recs[:6]
+
     history_path = Path("trade_history.csv")
     if not history_path.exists():
         print("\n❌ No trade_history.csv found. Run live trading first.")
@@ -244,8 +339,13 @@ def cmd_analytics(args):
         total_pnl = df["pnl"].sum()
         wins = df[df["pnl"] > 0]
         losses = df[df["pnl"] <= 0]
+        avg_win = wins["pnl"].mean() if len(wins) else 0.0
+        avg_loss = losses["pnl"].mean() if len(losses) else 0.0
+        expectancy = (len(wins) / len(df) * avg_win) + (len(losses) / len(df) * avg_loss) if len(df) else 0.0
         print(f"  Total PnL   : ${total_pnl:+.4f}")
         print(f"  Win rate    : {len(wins)/len(df)*100:.1f}%  ({len(wins)}W / {len(losses)}L)")
+        print(f"  Expectancy  : {expectancy:+.4f} per trade")
+        print(f"  Avg Win/Loss: {avg_win:+.4f} / {avg_loss:+.4f}")
         if len(losses) > 0 and losses["pnl"].sum() != 0:
             pf = abs(wins["pnl"].sum() / losses["pnl"].sum()) if len(losses) > 0 else 999
             print(f"  Profit factor: {pf:.2f}")
@@ -264,6 +364,8 @@ def cmd_analytics(args):
             arrow = "✅" if total > 0 else "❌"
             print(f"  {arrow} {setup:<20} {n:>6} {wr:>5.1f}% {total:>+10.4f} {avg:>+8.4f}")
 
+    _print_expectancy_table(df, "setup_type", "── Expectancy By Setup ─────────────────────────────", width=22)
+
     # By entry grade
     if "entry_grade" in df.columns and "pnl" in df.columns:
         print(f"\n  ── By Entry Grade ─────────────────────────────────")
@@ -281,6 +383,8 @@ def cmd_analytics(args):
             arrow = "✅" if total > 0 else "❌"
             print(f"  {arrow} {grade:<6}   {n:>6} {wr:>5.1f}% {total:>+10.4f} {avg:>+8.4f}")
 
+    _print_expectancy_table(df, "entry_grade", "── Expectancy By Grade ─────────────────────────────", width=12)
+
     # By symbol
     if "symbol" in df.columns and "pnl" in df.columns and df["symbol"].nunique() > 1:
         print(f"\n  ── By Symbol ──────────────────────────────────────")
@@ -294,6 +398,9 @@ def cmd_analytics(args):
             arrow = "✅" if total > 0 else "❌"
             print(f"  {arrow} {sym:<10}   {n:>6} {wr:>5.1f}% {total:>+10.4f}")
 
+    _print_expectancy_table(df, "symbol", "── Expectancy By Symbol ────────────────────────────", width=14)
+    _print_expectancy_table(df, "regime", "── Expectancy By Regime ────────────────────────────", width=14)
+
     # By exit reason
     if "exit_reason" in df.columns and "pnl" in df.columns:
         print(f"\n  ── By Exit Reason ─────────────────────────────────")
@@ -305,13 +412,15 @@ def cmd_analytics(args):
 
     # Recommendation
     print(f"\n  ── Recommendation ─────────────────────────────────")
-    if "entry_grade" in df.columns and "pnl" in df.columns:
+    recommendations = _recommendations(df)
+    if recommendations:
+        for rec in recommendations:
+            print(f"  - {rec}")
+    elif "entry_grade" in df.columns and "pnl" in df.columns:
         grade_pnl = df.groupby("entry_grade")["pnl"].mean()
         best_grade = grade_pnl.idxmax() if not grade_pnl.empty else "?"
-        worst_grade = grade_pnl.idxmin() if not grade_pnl.empty else "?"
         print(f"  Best entry grade: {best_grade} (avg {grade_pnl.get(best_grade, 0):+.4f} per trade)")
-        if grade_pnl.get(worst_grade, 0) < 0:
-            print(f"  Consider raising min_confidence to filter out grade-{worst_grade} entries")
+        print("  No negative bucket has enough sample size yet for a strong recommendation.")
     print(f"{'='*65}\n")
 
 
