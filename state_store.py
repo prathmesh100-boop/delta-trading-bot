@@ -4,7 +4,7 @@ state_store.py - durable local state for execution recovery
 
 import json
 import logging
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -12,6 +12,15 @@ from typing import Optional
 from risk import TradeRecord
 
 logger = logging.getLogger(__name__)
+
+TRADE_RECORD_FIELD_ALIASES = {
+    "quality_score": "entry_quality_score",
+    "regime": "regime_at_entry",
+    "htf": "htf_at_entry",
+    "rsi": "rsi_at_entry",
+    "adx": "adx_at_entry",
+}
+TRADE_RECORD_FIELDS = {field.name for field in fields(TradeRecord)}
 
 
 class StateStore:
@@ -51,10 +60,26 @@ class StateStore:
                 pass
             return None
         payload.pop("updated_at", None)
-        payload["entry_time"] = datetime.fromisoformat(payload["entry_time"])
-        if payload.get("exit_time"):
-            payload["exit_time"] = datetime.fromisoformat(payload["exit_time"])
-        return TradeRecord(**payload)
+        normalized = {}
+        for key, value in payload.items():
+            normalized_key = TRADE_RECORD_FIELD_ALIASES.get(key, key)
+            if normalized_key in TRADE_RECORD_FIELDS and normalized_key not in normalized:
+                normalized[normalized_key] = value
+
+        try:
+            normalized["entry_time"] = datetime.fromisoformat(normalized["entry_time"])
+            if normalized.get("exit_time"):
+                normalized["exit_time"] = datetime.fromisoformat(normalized["exit_time"])
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning("State file invalid for %s: %s", symbol, exc)
+            corrupt_path = path.with_suffix(".corrupt")
+            try:
+                path.replace(corrupt_path)
+            except OSError:
+                pass
+            return None
+
+        return TradeRecord(**normalized)
 
     def clear_trade(self, symbol: str) -> None:
         path = self._path_for_symbol(symbol)
