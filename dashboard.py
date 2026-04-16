@@ -440,8 +440,12 @@ function updateEquity(labels, values) {
   equityChart.update('none');
 }
 
-function updateMarketCards(items) {
+function updateMarketCards(items, errorMessage = '') {
   const el = document.getElementById('market-cards');
+  if (errorMessage) {
+    el.innerHTML = `<div class="card"><div style="color:var(--red);font-size:11px">${errorMessage}</div></div>`;
+    return;
+  }
   if (!items || !items.length) {
     el.innerHTML = '<div class="card"><div style="color:var(--muted);font-size:11px">No live market data</div></div>';
     return;
@@ -454,9 +458,24 @@ function updateMarketCards(items) {
 }
 
 function updateMarketChart(payload) {
+  if (payload.error) {
+    marketChart.data.labels = [''];
+    marketChart.data.datasets = [{
+      label: payload.error,
+      data: [0],
+      borderColor: '#ef4444',
+      backgroundColor: 'rgba(239,68,68,.10)',
+      borderWidth: 1.7,
+      pointRadius: 0,
+      tension: 0.2,
+      fill: false
+    }];
+    marketChart.update('none');
+    return;
+  }
   marketChart.data.labels = payload.labels || [];
   marketChart.data.datasets = (payload.datasets || []).map(ds => ({
-    label: ds.label,
+      label: ds.label,
     data: ds.data,
     borderColor: ds.borderColor,
     backgroundColor: ds.borderColor + '22',
@@ -548,11 +567,17 @@ async function refreshLivePanels() {
     ]);
     const market = await marketRes.json();
     const chart = await chartRes.json();
-    updateMarketCards(market.tickers || []);
+    updateMarketCards(market.tickers || [], market.error || '');
     updatePositions(market.positions || []);
     updateMarketChart(chart);
+    if (market.error || chart.error) {
+      document.getElementById('last-update').textContent = 'Live data unavailable';
+    }
   } catch (e) {
     console.error('Live panel refresh error', e);
+    updateMarketCards([], 'Live market fetch failed');
+    updateMarketChart({ error: 'Live market fetch failed' });
+    document.getElementById('last-update').textContent = 'Live data unavailable';
   }
 }
 
