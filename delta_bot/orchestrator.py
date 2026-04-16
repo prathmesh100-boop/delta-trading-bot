@@ -108,6 +108,7 @@ async def run_multi_symbol(args, api_key: str, api_secret: str, logger) -> None:
 
     audit_store = build_audit_store(StorageConfig())
     portfolio_risk = build_portfolio_risk_manager(initial_capital=args.capital, store=audit_store)
+    portfolio_risk.reset_open_positions("portfolio_runtime_startup")
 
     async with DeltaRESTClient(api_key, api_secret) as discovery_rest:
         symbol_configs = await resolve_symbol_configs(discovery_rest, symbols)

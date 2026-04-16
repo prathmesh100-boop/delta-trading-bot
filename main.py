@@ -81,6 +81,7 @@ async def cmd_trade(args):
     risk_mgr = RiskManager(risk_cfg, initial_capital=args.capital)
     audit_store = build_audit_store(StorageConfig())
     portfolio_risk = build_portfolio_risk_manager(initial_capital=args.capital, store=audit_store)
+    portfolio_risk.reset_open_positions("single_bot_startup")
     audit_store.record_event(
         "system",
         "trade_command_started",

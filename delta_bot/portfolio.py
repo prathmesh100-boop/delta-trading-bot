@@ -138,6 +138,20 @@ class PortfolioRiskManager:
         )
         self._persist_state()
 
+    def reset_open_positions(self, reason: str = "startup_reconcile") -> int:
+        cleared = len(self.state.positions)
+        if cleared == 0:
+            return 0
+        self.state.positions.clear()
+        self.store.record_event(
+            "risk",
+            "portfolio_positions_reset",
+            {"reason": reason, "cleared_positions": cleared},
+            severity="warning",
+        )
+        self._persist_state()
+        return cleared
+
     def close_trade(self, trade_id: str, pnl: float) -> None:
         self.state.positions.pop(trade_id, None)
         self.state.current_equity = max(0.0, self.state.current_equity + pnl)
@@ -175,4 +189,3 @@ class PortfolioRiskManager:
         snapshot = self.snapshot()
         self.store.set_runtime_state("portfolio", "state", snapshot)
         self.store.record_portfolio_snapshot(snapshot)
-
