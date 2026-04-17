@@ -119,10 +119,6 @@ body::before {
   letter-spacing: -0.06em;
 }
 
-.brand h1 {
-  font-size: clamp(28px, 3vw, 42px);
-}
-
 .brand p,
 .panel-head p,
 .hero-main p,
@@ -137,6 +133,14 @@ body::before {
   margin: 10px 0 0;
   max-width: 760px;
   line-height: 1.7;
+}
+
+.brand-subtitle {
+  margin: 6px 0 0;
+  font-size: clamp(22px, 2.1vw, 30px);
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  color: var(--text);
 }
 
 .status-strip {
@@ -282,11 +286,11 @@ body::before {
 }
 
 .watchlist-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .watch-card {
-  padding: 22px;
+  padding: 18px;
   background:
     radial-gradient(circle at top right, rgba(83, 211, 255, 0.08), transparent 25%),
     linear-gradient(180deg, rgba(15, 24, 39, 0.98), rgba(9, 15, 24, 0.98));
@@ -304,29 +308,29 @@ body::before {
 }
 
 .coin-symbol {
-  font-size: 30px;
+  font-size: 22px;
   font-weight: 700;
   letter-spacing: -0.05em;
 }
 
 .coin-sub {
-  margin-top: 8px;
-  font-size: 13px;
+  margin-top: 6px;
+  font-size: 11px;
   line-height: 1.5;
 }
 
 .coin-tag {
-  padding: 8px 14px;
+  padding: 7px 11px;
   border-radius: 999px;
   border: 1px solid rgba(83, 211, 255, 0.2);
   background: rgba(83, 211, 255, 0.08);
   color: var(--sky);
-  font-size: 12px;
+  font-size: 11px;
   white-space: nowrap;
 }
 
 .coin-price {
-  font-size: clamp(42px, 4vw, 58px);
+  font-size: clamp(28px, 2.8vw, 38px);
   font-weight: 700;
   letter-spacing: -0.06em;
   line-height: 0.95;
@@ -334,7 +338,7 @@ body::before {
 
 .watch-price-row {
   align-items: end;
-  margin-top: 18px;
+  margin-top: 14px;
 }
 
 .pill-wrap,
@@ -345,36 +349,37 @@ body::before {
 }
 
 .pill {
-  padding: 7px 12px;
-  font-size: 10px;
-  letter-spacing: 0.14em;
+  padding: 6px 10px;
+  font-size: 9px;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
 }
 
 .decision-grid {
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  margin: 18px 0 12px;
+  margin: 14px 0 10px;
+  gap: 10px;
 }
 
 .compact-gap {
-  margin-top: 14px;
+  margin-top: 10px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .watch-card .metric-card {
-  min-height: 96px;
-  padding: 14px;
-  border-radius: 18px;
+  min-height: 80px;
+  padding: 11px 12px;
+  border-radius: 16px;
 }
 
 .watch-card .metric-card span {
-  font-size: 10px;
-  letter-spacing: 0.18em;
+  font-size: 9px;
+  letter-spacing: 0.14em;
 }
 
 .watch-card .metric-card strong {
-  margin-top: 10px;
-  font-size: clamp(16px, 2.1vw, 24px);
+  margin-top: 8px;
+  font-size: clamp(14px, 1.55vw, 20px);
   line-height: 1.08;
 }
 
@@ -393,12 +398,12 @@ body::before {
 }
 
 .blocker-chip {
-  padding: 7px 10px;
+  padding: 6px 9px;
   border-radius: 999px;
   border: 1px solid rgba(255, 255, 255, 0.07);
   background: rgba(255, 255, 255, 0.035);
   color: var(--muted-strong);
-  font-size: 11px;
+  font-size: 10px;
 }
 
 .two-col {
@@ -502,9 +507,23 @@ tbody tr:hover {
   font-size: 13px;
 }
 
-@media (max-width: 1320px) {
+@media (max-width: 1500px) {
   .watchlist-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 1320px) {
+  .watch-card {
+    padding: 16px;
+  }
+
+  .coin-price {
+    font-size: 32px;
+  }
+
+  .watch-card .metric-card strong {
+    font-size: 18px;
   }
 }
 
@@ -513,6 +532,10 @@ tbody tr:hover {
   .hero-grid,
   .two-col {
     grid-template-columns: 1fr;
+  }
+
+  .watchlist-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
@@ -534,6 +557,10 @@ tbody tr:hover {
     grid-template-columns: 1fr;
   }
 
+  .watchlist-grid {
+    grid-template-columns: 1fr;
+  }
+
   .compact-gap {
     grid-template-columns: 1fr;
   }
@@ -548,12 +575,38 @@ tbody tr:hover {
   }
 
   .coin-price {
-    font-size: 40px;
+    font-size: 30px;
   }
 
   .panel-head h3,
-  .board-symbol,
-  .coin-symbol {
+  .board-symbol {
     font-size: 22px;
+  }
+}
+
+@media (max-width: 640px) {
+  .app-frame {
+    padding: 14px;
+    border-radius: 24px;
+  }
+
+  .panel,
+  .watch-card,
+  .hero-main {
+    padding: 14px;
+    border-radius: 22px;
+  }
+
+  .status-pill {
+    padding: 8px 12px;
+    font-size: 11px;
+  }
+
+  .coin-symbol {
+    font-size: 20px;
+  }
+
+  .brand-subtitle {
+    font-size: 20px;
   }
 }

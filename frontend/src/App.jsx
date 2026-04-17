@@ -246,7 +246,7 @@ export default function App() {
             <div className="brand-mark" />
             <div>
               <div className="eyebrow">Delta Engine</div>
-              <h1>Trading Terminal React | PRATHMESH SONAWANE</h1>
+              <p className="brand-subtitle">PRATHMESH SONAWANE</p>
               <p>Execution-aware dashboard with live wallet, HTF bias, blockers, and rapid pricing.</p>
             </div>
           </div>
