@@ -118,7 +118,7 @@ async def cmd_trade(args):
         print(f"  Contract Val    : {product.get('contract_value')}")
         print(f"  Account Asset   : {account_asset}")
         print(f"  Allocated Capital: ${args.capital:.2f} {account_asset}  ← this bot's slice only")
-        print(f"  Leverage        : {args.leverage}x")
+        print(f"  Leverage        : {risk_mgr.get_leverage_for_symbol(args.symbol):.0f}x")
         print(f"  Risk/Trade      : {args.risk_per_trade*100:.1f}%")
         print(f"  Max DD Halt     : {args.max_drawdown*100:.0f}%")
         print(f"  Daily Loss Halt : {args.daily_loss_limit*100:.0f}%")
@@ -156,8 +156,13 @@ async def cmd_trade(args):
             portfolio_risk     = portfolio_risk,
         )
 
-        logger.info("🚀 Starting V8: %s | allocated=%.2f | %dx leverage | %dm candles",
-                    args.symbol, args.capital, args.leverage, args.resolution)
+        logger.info(
+            "🚀 Starting V8: %s | allocated=%.2f | %.0fx leverage | %dm candles",
+            args.symbol,
+            args.capital,
+            risk_mgr.get_leverage_for_symbol(args.symbol),
+            args.resolution,
+        )
 
         try:
             await engine.run()
@@ -560,8 +565,8 @@ Backtest:
     t.add_argument("--slow-ema",         type=int,   default=50,    dest="slow_ema")
 
     tp = sub.add_parser("trade-portfolio", help="Run one shared-portfolio process across multiple symbols")
-    tp.add_argument("--symbols",          default="BTCUSD,ETHUSD,SOLUSD",
-                    help="Comma-separated symbol list, e.g. BTCUSD,ETHUSD,SOLUSD")
+    tp.add_argument("--symbols",          default="BTCUSD,ETHUSD,SOLUSD,BNBUSD,XRPUSD",
+                    help="Comma-separated symbol list, e.g. BTCUSD,ETHUSD,SOLUSD,BNBUSD,XRPUSD")
     tp.add_argument("--capital",          type=float, default=90.0,
                     help="Shared portfolio capital across all symbols in this process")
     tp.add_argument("--leverage",         type=int,   default=3)

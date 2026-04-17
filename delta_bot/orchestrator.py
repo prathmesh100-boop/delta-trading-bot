@@ -71,7 +71,8 @@ def build_risk_config_from_args(args, symbol: str) -> RiskConfig:
         profit_lock_trail_pct=0.008,
         min_confidence=args.min_confidence,
     )
-    cfg.leverage_by_symbol[symbol] = float(args.leverage)
+    if symbol not in cfg.leverage_by_symbol and getattr(args, "leverage", None):
+        cfg.leverage_by_symbol[symbol] = float(args.leverage)
     return cfg
 
 

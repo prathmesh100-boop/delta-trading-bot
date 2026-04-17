@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import aiohttp
 import websockets
+from delta_bot.symbol_specs import SYMBOL_SPECS
 from websockets.exceptions import ConnectionClosed
 
 logger = logging.getLogger(__name__)
@@ -162,19 +163,15 @@ class RateLimiter:
 # ─── Lot Size Registry ────────────────────────────────────────────────────────
 
 FALLBACK_LOT_SIZES: Dict[str, float] = {
-    "BTC_USDT":  0.001,
-    "ETH_USDT":  0.01,
-    "SOL_USDT":  1.0,
-    "BNB_USDT":  0.1,
-    "XRP_USDT":  10.0,
-    "BTCUSD":    0.001,
-    "ETHUSD":    0.01,
-    "MATIC_USDT":10.0,
+    symbol: spec.fallback_lot_size for symbol, spec in SYMBOL_SPECS.items()
+}
+FALLBACK_LOT_SIZES.update({
+    "MATIC_USDT": 10.0,
     "DOGE_USDT": 100.0,
     "AVAX_USDT": 1.0,
     "LINK_USDT": 1.0,
-    "DOT_USDT":  1.0,
-}
+    "DOT_USDT": 1.0,
+})
 
 # ─── REST Client ──────────────────────────────────────────────────────────────
 

@@ -19,8 +19,10 @@ class StorageConfig:
 class PortfolioRiskSettings:
     max_total_exposure_pct: float = 1.0
     max_symbol_exposure_pct: float = 0.35
-    max_open_positions: int = 3
-    max_portfolio_risk_pct: float = 0.03
+    max_total_margin_pct: float = 1.0
+    max_symbol_margin_pct: float = 0.35
+    max_open_positions: int = 5
+    max_portfolio_risk_pct: float = 0.05
     max_drawdown_pct: float = 0.15
     daily_loss_limit_pct: float = 0.08
 

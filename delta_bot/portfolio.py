@@ -14,6 +14,7 @@ class PortfolioPosition:
     symbol: str
     side: str
     notional_usd: float
+    margin_used_usd: float
     risk_usd: float
     opened_at: str
 
@@ -52,7 +53,15 @@ class PortfolioRiskManager:
         if not snapshot:
             return
         positions = {
-            key: PortfolioPosition(**value)
+            key: PortfolioPosition(
+                trade_id=value["trade_id"],
+                symbol=value["symbol"],
+                side=value["side"],
+                notional_usd=value.get("notional_usd", 0.0),
+                margin_used_usd=value.get("margin_used_usd", 0.0),
+                risk_usd=value.get("risk_usd", 0.0),
+                opened_at=value.get("opened_at", datetime.now(timezone.utc).isoformat()),
+            )
             for key, value in snapshot.get("positions", {}).items()
         }
         self.state = PortfolioState(
@@ -87,6 +96,9 @@ class PortfolioRiskManager:
     def _open_notional(self) -> float:
         return sum(position.notional_usd for position in self.state.positions.values())
 
+    def _open_margin(self) -> float:
+        return sum(position.margin_used_usd for position in self.state.positions.values())
+
     def _open_risk(self) -> float:
         return sum(position.risk_usd for position in self.state.positions.values())
 
@@ -102,7 +114,13 @@ class PortfolioRiskManager:
             self.state.kill_switch = False
         self._persist_state()
 
-    def can_open_trade(self, symbol: str, proposed_notional_usd: float, proposed_risk_usd: float) -> Tuple[bool, str]:
+    def can_open_trade(
+        self,
+        symbol: str,
+        proposed_notional_usd: float,
+        proposed_risk_usd: float,
+        proposed_margin_usd: float,
+    ) -> Tuple[bool, str]:
         self._refresh_daily_if_needed()
         if self.state.kill_switch:
             return False, "portfolio_kill_switch_active"
@@ -116,23 +134,32 @@ class PortfolioRiskManager:
             return False, "portfolio_max_open_positions"
 
         total_capital = max(self.state.current_capital, 1.0)
-        symbol_notional = sum(
-            position.notional_usd for position in self.state.positions.values() if position.symbol == symbol
+        symbol_margin = sum(
+            position.margin_used_usd for position in self.state.positions.values() if position.symbol == symbol
         )
-        if (self._open_notional() + proposed_notional_usd) > total_capital * self.settings.max_total_exposure_pct:
+        if (self._open_margin() + proposed_margin_usd) > total_capital * self.settings.max_total_margin_pct:
             return False, "portfolio_total_exposure_limit"
-        if (symbol_notional + proposed_notional_usd) > total_capital * self.settings.max_symbol_exposure_pct:
+        if (symbol_margin + proposed_margin_usd) > total_capital * self.settings.max_symbol_margin_pct:
             return False, "portfolio_symbol_exposure_limit"
         if (self._open_risk() + proposed_risk_usd) > total_capital * self.settings.max_portfolio_risk_pct:
             return False, "portfolio_open_risk_limit"
         return True, "ok"
 
-    def register_trade(self, trade_id: str, symbol: str, side: str, notional_usd: float, risk_usd: float) -> None:
+    def register_trade(
+        self,
+        trade_id: str,
+        symbol: str,
+        side: str,
+        notional_usd: float,
+        margin_used_usd: float,
+        risk_usd: float,
+    ) -> None:
         self.state.positions[trade_id] = PortfolioPosition(
             trade_id=trade_id,
             symbol=symbol,
             side=side,
             notional_usd=notional_usd,
+            margin_used_usd=margin_used_usd,
             risk_usd=risk_usd,
             opened_at=datetime.now(timezone.utc).isoformat(),
         )
@@ -180,6 +207,7 @@ class PortfolioRiskManager:
             "daily_loss_pct": round(self._daily_loss_pct(), 6),
             "open_positions": len(self.state.positions),
             "open_notional_usd": round(self._open_notional(), 6),
+            "open_margin_used_usd": round(self._open_margin(), 6),
             "open_risk_usd": round(self._open_risk(), 6),
             "kill_switch": self.state.kill_switch,
             "positions": {key: asdict(value) for key, value in self.state.positions.items()},

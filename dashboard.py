@@ -38,7 +38,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 
 def _dashboard_symbols() -> List[str]:
-    raw = os.getenv("DASHBOARD_SYMBOLS", "BTCUSD,ETHUSD,SOLUSD")
+    raw = os.getenv("DASHBOARD_SYMBOLS", "BTCUSD,ETHUSD,SOLUSD,BNBUSD,XRPUSD")
     seen = set()
     symbols: List[str] = []
     for item in raw.split(","):

@@ -534,19 +534,31 @@ class ExecutionEngine:
             return
 
         actual_notional = lots * self._lot_size * price
+        margin_used = self.risk.estimate_margin_required(
+            self.symbol,
+            lots,
+            price,
+            self._lot_size,
+        )
         proposed_risk = abs(price - signal.stop_loss) * lots * self._lot_size
         if self.portfolio_risk:
             allowed, reason = self.portfolio_risk.can_open_trade(
                 self.symbol,
                 proposed_notional_usd=actual_notional,
                 proposed_risk_usd=proposed_risk,
+                proposed_margin_usd=margin_used,
             )
             if not allowed:
                 logger.warning("Portfolio risk rejected trade: %s", reason)
                 self._audit_event(
                     "risk",
                     "signal_rejected_portfolio_risk",
-                    {"reason": reason, "notional_usd": actual_notional, "proposed_risk_usd": proposed_risk},
+                    {
+                        "reason": reason,
+                        "notional_usd": actual_notional,
+                        "margin_used_usd": margin_used,
+                        "proposed_risk_usd": proposed_risk,
+                    },
                     severity="warning",
                 )
                 return
@@ -629,6 +641,7 @@ class ExecutionEngine:
                 symbol=trade.symbol,
                 side=trade.side,
                 notional_usd=trade.notional_usd,
+                margin_used_usd=margin_used,
                 risk_usd=proposed_risk,
             )
         self._last_entry_ts = time.time()
@@ -645,6 +658,7 @@ class ExecutionEngine:
                 "stop_loss": trade.stop_loss,
                 "take_profit": trade.take_profit,
                 "notional_usd": trade.notional_usd,
+                "margin_used_usd": margin_used,
                 "setup_type": trade.setup_type,
                 "entry_grade": trade.entry_grade,
             },
@@ -662,6 +676,7 @@ class ExecutionEngine:
             "lots":             lots,
             "contract_value":   self._lot_size,
             "notional_usd":     round(trade.notional_usd, 4),
+            "margin_used_usd":  round(margin_used, 4),
             "confidence":       signal.confidence,
             "setup_type":       setup_type,
             "entry_grade":      entry_grade,
@@ -836,11 +851,18 @@ class ExecutionEngine:
             self.risk.register_trade(recovered)
             if self.portfolio_risk:
                 risk_usd = abs(recovered.entry_price - recovered.stop_loss) * recovered.filled_size * recovered.contract_value
+                margin_used_usd = self.risk.estimate_margin_required(
+                    recovered.symbol,
+                    recovered.filled_size,
+                    recovered.entry_price,
+                    recovered.contract_value,
+                )
                 self.portfolio_risk.register_trade(
                     recovered.id,
                     symbol=recovered.symbol,
                     side=recovered.side,
                     notional_usd=recovered.notional_usd,
+                    margin_used_usd=margin_used_usd,
                     risk_usd=risk_usd,
                 )
             self._persist_trade_state()

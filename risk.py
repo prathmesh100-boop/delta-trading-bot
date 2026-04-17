@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
+from delta_bot.symbol_specs import SYMBOL_SPECS, get_symbol_spec
 from strategy import Signal
 
 logger = logging.getLogger(__name__)
@@ -35,14 +36,10 @@ class RiskConfig:
     min_confidence: float = 0.58
 
     leverage_by_symbol: Dict[str, float] = field(default_factory=lambda: {
-        "BTC_USDT": 5.0,
-        "ETH_USDT": 5.0,
-        "SOL_USDT": 5.0,
-        "BNB_USDT": 5.0,
-        "XRP_USDT": 3.0,
-        "BTCUSD":   5.0,
-        "ETHUSD":   5.0,
-        "SOLUSD":   5.0,
+        symbol: spec.leverage for symbol, spec in SYMBOL_SPECS.items()
+    })
+    margin_per_lot_by_symbol: Dict[str, float] = field(default_factory=lambda: {
+        symbol: spec.margin_per_lot_usd for symbol, spec in SYMBOL_SPECS.items()
     })
 
 
@@ -261,17 +258,41 @@ class RiskManager:
         leverage     = self.config.leverage_by_symbol.get(symbol, self.config.leverage)
         risk_amount  = equity * self.config.risk_per_trade
         sl_pct       = sl_distance / entry_price
-        raw_notional = (risk_amount / sl_pct) * leverage
+        raw_notional = risk_amount / sl_pct
         max_notional = equity * self.config.max_position_size_pct * leverage
         notional     = min(raw_notional, max_notional)
         logger.debug(
-            "Size: equity=%.2f risk=%.2f sl_pct=%.4f leverage=%.0f -> notional=%.2f",
-            equity, risk_amount, sl_pct, leverage, notional,
+            "Size: equity=%.2f risk=%.2f sl_pct=%.4f leverage=%.0f -> raw_notional=%.2f capped_notional=%.2f",
+            equity, risk_amount, sl_pct, leverage, raw_notional, notional,
         )
         return notional
 
     def get_leverage_for_symbol(self, symbol: str) -> float:
         return self.config.leverage_by_symbol.get(symbol, self.config.leverage)
+
+    def estimate_margin_required(
+        self,
+        symbol: str,
+        lots: int,
+        entry_price: float,
+        contract_value: float = 0.0,
+    ) -> float:
+        if lots <= 0:
+            return 0.0
+
+        configured_margin = self.config.margin_per_lot_by_symbol.get(symbol)
+        if configured_margin and configured_margin > 0:
+            return configured_margin * lots
+
+        leverage = max(self.get_leverage_for_symbol(symbol), 1.0)
+        lot_value = max(contract_value, 0.0) * max(entry_price, 0.0)
+        if lot_value <= 0:
+            spec = get_symbol_spec(symbol)
+            if spec:
+                lot_value = spec.fallback_lot_size * max(entry_price, 0.0)
+        if lot_value <= 0:
+            return 0.0
+        return (lot_value / leverage) * lots
 
     def register_trade(self, trade: TradeRecord):
         self._open_trades.append(trade)
