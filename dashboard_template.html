@@ -1,0 +1,1319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Delta Trading Terminal V8</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #07111d;
+    --bg-soft: rgba(11, 21, 36, 0.78);
+    --panel: rgba(10, 18, 31, 0.92);
+    --panel-2: rgba(17, 29, 48, 0.92);
+    --line: rgba(150, 180, 214, 0.14);
+    --line-soft: rgba(150, 180, 214, 0.08);
+    --text: #f4f7fb;
+    --muted: #8da2bc;
+    --muted-2: #6f839d;
+    --green: #3ce6b0;
+    --red: #ff6b7a;
+    --amber: #ffbd5c;
+    --sky: #62c7ff;
+    --teal: #7cf3d7;
+    --violet: #8f88ff;
+    --shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+    --radius-xl: 30px;
+    --radius-lg: 24px;
+    --radius-md: 18px;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    font-family: "Sora", "Aptos", "Segoe UI", sans-serif;
+    color: var(--text);
+    background:
+      radial-gradient(circle at 0% 0%, rgba(98, 199, 255, 0.18), transparent 30%),
+      radial-gradient(circle at 100% 0%, rgba(124, 243, 215, 0.12), transparent 25%),
+      radial-gradient(circle at 50% 100%, rgba(143, 136, 255, 0.1), transparent 34%),
+      linear-gradient(180deg, #08111c 0%, #040912 100%);
+  }
+
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+    background-size: 42px 42px;
+    mask-image: radial-gradient(circle at center, black, transparent 92%);
+    opacity: 0.55;
+  }
+
+  .shell {
+    position: relative;
+    max-width: 1580px;
+    margin: 0 auto;
+    padding: 28px 20px 40px;
+  }
+
+  .frame {
+    border: 1px solid var(--line);
+    border-radius: 36px;
+    background: linear-gradient(180deg, rgba(7, 14, 24, 0.84), rgba(5, 10, 18, 0.96));
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    backdrop-filter: blur(20px);
+  }
+
+  .topbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 18px;
+    padding: 18px 22px;
+    border-bottom: 1px solid var(--line-soft);
+    background: linear-gradient(180deg, rgba(255,255,255,0.015), rgba(255,255,255,0));
+  }
+
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+
+  .brand-mark {
+    position: relative;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--sky), var(--green));
+    box-shadow: 0 0 24px rgba(98, 199, 255, 0.45);
+  }
+
+  .brand-mark::after {
+    content: "";
+    position: absolute;
+    inset: -8px;
+    border-radius: 50%;
+    border: 1px solid rgba(124, 243, 215, 0.22);
+  }
+
+  .brand-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .eyebrow {
+    color: var(--sky);
+    font-size: 10px;
+    letter-spacing: 0.24em;
+    text-transform: uppercase;
+  }
+
+  .brand-meta strong {
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+  }
+
+  .brand-meta span {
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .status-strip {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 10px;
+  }
+
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    background: rgba(255,255,255,0.03);
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 18px rgba(60, 230, 176, 0.55);
+    animation: pulse 2s infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.45; transform: scale(0.92); }
+  }
+
+  .content {
+    padding: 22px;
+    display: grid;
+    gap: 18px;
+  }
+
+  .hero {
+    display: grid;
+    grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.7fr);
+    gap: 18px;
+  }
+
+  .panel {
+    position: relative;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-xl);
+    background: linear-gradient(180deg, rgba(13, 23, 38, 0.95), rgba(8, 16, 28, 0.92));
+    overflow: hidden;
+  }
+
+  .panel::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: linear-gradient(140deg, rgba(98,199,255,0.08), transparent 32%, transparent 68%, rgba(124,243,215,0.05));
+  }
+
+  .hero-main {
+    padding: 26px;
+    min-height: 256px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    background:
+      radial-gradient(circle at 0% 0%, rgba(98, 199, 255, 0.15), transparent 30%),
+      radial-gradient(circle at 100% 100%, rgba(124, 243, 215, 0.12), transparent 28%),
+      linear-gradient(135deg, rgba(21, 38, 63, 0.96), rgba(7, 16, 28, 0.96));
+  }
+
+  .hero-main h1 {
+    margin: 0;
+    font-size: clamp(34px, 5vw, 58px);
+    line-height: 0.94;
+    letter-spacing: -0.06em;
+    max-width: 720px;
+  }
+
+  .hero-main p {
+    margin: 12px 0 0;
+    max-width: 680px;
+    color: var(--muted);
+    line-height: 1.7;
+    font-size: 14px;
+  }
+
+  .hero-rail {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    margin-top: 24px;
+  }
+
+  .rail-chip {
+    padding: 14px 16px;
+    border-radius: 18px;
+    border: 1px solid rgba(255,255,255,0.08);
+    background: rgba(255,255,255,0.04);
+  }
+
+  .rail-chip span {
+    display: block;
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    margin-bottom: 8px;
+  }
+
+  .rail-chip strong {
+    font-size: 16px;
+    letter-spacing: -0.03em;
+  }
+
+  .hero-side {
+    padding: 22px;
+    display: grid;
+    gap: 14px;
+    align-content: space-between;
+  }
+
+  .section-label,
+  .metric-label,
+  .panel-head h2,
+  .panel-head span,
+  .analytics-panel h3 {
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    font-size: 10px;
+  }
+
+  .section-label,
+  .metric-label,
+  .panel-head span {
+    color: var(--muted-2);
+  }
+
+  .headline-stat {
+    padding: 16px 18px;
+    border-radius: 22px;
+    border: 1px solid var(--line);
+    background: linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.02));
+  }
+
+  .headline-stat .metric-value {
+    margin-top: 10px;
+    font-size: 34px;
+    letter-spacing: -0.05em;
+    font-weight: 700;
+  }
+
+  .headline-sub {
+    margin-top: 6px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .headline-progress {
+    margin-top: 16px;
+    height: 8px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.08);
+    overflow: hidden;
+  }
+
+  .headline-progress > span {
+    display: block;
+    height: 100%;
+    width: 0;
+    border-radius: inherit;
+    background: linear-gradient(90deg, var(--green), var(--sky));
+    transition: width 0.35s ease;
+  }
+
+  .metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 14px;
+  }
+
+  .metric-card,
+  .analytics-panel,
+  .table-panel,
+  .chart-panel {
+    border: 1px solid var(--line);
+    border-radius: var(--radius-lg);
+    background: linear-gradient(180deg, rgba(12, 21, 36, 0.92), rgba(8, 15, 26, 0.9));
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.02);
+  }
+
+  .metric-card {
+    padding: 18px;
+    min-height: 136px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+  }
+
+  .metric-card .metric-value {
+    margin-top: 10px;
+    font-size: 30px;
+    font-weight: 700;
+    letter-spacing: -0.05em;
+  }
+
+  .metric-note {
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .market-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 14px;
+  }
+
+  .market-card {
+    padding: 20px;
+    min-height: 220px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    border: 1px solid var(--line);
+    border-radius: 26px;
+    background:
+      radial-gradient(circle at top right, rgba(98, 199, 255, 0.12), transparent 24%),
+      linear-gradient(180deg, rgba(13, 24, 41, 0.94), rgba(8, 16, 27, 0.94));
+    position: relative;
+    overflow: hidden;
+  }
+
+  .market-card::after {
+    content: "";
+    position: absolute;
+    right: -30px;
+    top: -30px;
+    width: 120px;
+    height: 120px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(124,243,215,0.16), transparent 70%);
+    pointer-events: none;
+  }
+
+  .market-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 12px;
+  }
+
+  .coin-symbol {
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+  }
+
+  .coin-sub {
+    margin-top: 4px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .coin-tag {
+    padding: 7px 11px;
+    border-radius: 999px;
+    border: 1px solid rgba(98, 199, 255, 0.2);
+    background: rgba(98, 199, 255, 0.1);
+    color: var(--sky);
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .coin-price {
+    margin: 16px 0 12px;
+    font-size: 40px;
+    font-weight: 700;
+    letter-spacing: -0.06em;
+  }
+
+  .coin-strip {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px;
+  }
+
+  .coin-meta-box {
+    padding: 10px 12px;
+    border-radius: 16px;
+    border: 1px solid rgba(255,255,255,0.06);
+    background: rgba(255,255,255,0.03);
+  }
+
+  .coin-meta-box span {
+    display: block;
+    color: var(--muted);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 6px;
+  }
+
+  .coin-meta-box strong {
+    font-size: 13px;
+  }
+
+  .panel-block {
+    display: grid;
+    gap: 14px;
+  }
+
+  .panel-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    gap: 12px;
+    margin-bottom: 14px;
+  }
+
+  .panel-head h2 {
+    margin: 6px 0 0;
+    font-size: 22px;
+    letter-spacing: -0.04em;
+    text-transform: none;
+    color: var(--text);
+  }
+
+  .panel-head p {
+    margin: 6px 0 0;
+    color: var(--muted);
+    font-size: 13px;
+  }
+
+  .chart-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr);
+    gap: 16px;
+  }
+
+  .chart-panel {
+    padding: 18px 18px 10px;
+  }
+
+  .chart-wrap {
+    height: 320px;
+    position: relative;
+  }
+
+  .table-panel {
+    padding: 16px;
+  }
+
+  .table-wrap {
+    overflow-x: auto;
+    border-radius: 18px;
+    border: 1px solid var(--line-soft);
+    background: rgba(255,255,255,0.015);
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    min-width: 880px;
+  }
+
+  thead th {
+    padding: 14px 14px;
+    text-align: left;
+    color: var(--muted-2);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    border-bottom: 1px solid var(--line-soft);
+    background: rgba(255,255,255,0.02);
+  }
+
+  tbody tr {
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    transition: background 0.2s ease;
+  }
+
+  tbody tr:hover {
+    background: rgba(98, 199, 255, 0.05);
+  }
+
+  tbody td {
+    padding: 14px;
+    font-size: 13px;
+  }
+
+  .tag {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 72px;
+    padding: 6px 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+  }
+
+  .tag-long,
+  .tag-tp {
+    color: var(--green);
+    background: rgba(60, 230, 176, 0.1);
+    border: 1px solid rgba(60, 230, 176, 0.22);
+  }
+
+  .tag-short,
+  .tag-sl {
+    color: var(--red);
+    background: rgba(255, 107, 122, 0.1);
+    border: 1px solid rgba(255, 107, 122, 0.22);
+  }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 10px;
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .badge-A { color: var(--green); background: rgba(60,230,176,0.12); }
+  .badge-B { color: var(--sky); background: rgba(98,199,255,0.14); }
+  .badge-C { color: var(--amber); background: rgba(255,189,92,0.12); }
+  .badge-D { color: var(--red); background: rgba(255,107,122,0.14); }
+  .badge-U { color: var(--muted); background: rgba(141,162,188,0.12); }
+
+  .analytics-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+  }
+
+  .analytics-panel {
+    padding: 18px;
+  }
+
+  .analytics-panel h3 {
+    margin: 0 0 16px;
+    color: var(--muted);
+  }
+
+  .analytics-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 12px;
+    padding: 13px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+  }
+
+  .analytics-row:last-child {
+    border-bottom: none;
+    padding-bottom: 0;
+  }
+
+  .analytics-name {
+    color: var(--text);
+    font-size: 14px;
+    text-transform: capitalize;
+  }
+
+  .analytics-meta {
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .analytics-pnl {
+    font-size: 13px;
+    font-weight: 700;
+  }
+
+  .positive { color: var(--green); }
+  .negative { color: var(--red); }
+  .neutral { color: var(--sky); }
+
+  .empty-state {
+    padding: 28px 14px;
+    color: var(--muted);
+    text-align: center;
+  }
+
+  .footer {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    color: var(--muted);
+    font-size: 12px;
+    padding: 0 4px;
+  }
+
+  .fade-up {
+    animation: fadeUp 0.55s ease both;
+  }
+
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  @media (max-width: 1220px) {
+    .hero,
+    .chart-grid,
+    .analytics-grid,
+    .market-grid,
+    .metrics-grid {
+      grid-template-columns: 1fr 1fr;
+    }
+
+    .hero {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  @media (max-width: 900px) {
+    .topbar {
+      flex-direction: column;
+      align-items: flex-start;
+    }
+
+    .status-strip {
+      justify-content: flex-start;
+    }
+
+    .market-grid,
+    .metrics-grid,
+    .chart-grid,
+    .analytics-grid,
+    .hero-rail {
+      grid-template-columns: 1fr;
+    }
+
+    .coin-strip {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  @media (max-width: 640px) {
+    .shell { padding: 12px; }
+    .content { padding: 14px; }
+    .topbar { padding: 16px; }
+    .hero-main,
+    .hero-side,
+    .metric-card,
+    .chart-panel,
+    .table-panel,
+    .analytics-panel,
+    .market-card { padding: 16px; }
+    .hero-main h1 { font-size: 34px; }
+    .coin-price { font-size: 32px; }
+    .headline-stat .metric-value,
+    .metric-card .metric-value { font-size: 28px; }
+  }
+</style>
+</head>
+<body>
+  <div class="shell">
+    <div class="frame fade-up">
+      <div class="topbar">
+        <div class="brand">
+          <div class="brand-mark"></div>
+          <div class="brand-meta">
+            <div class="eyebrow">Delta Engine</div>
+            <strong>Trading Terminal V8</strong>
+            <span>Live market telemetry, execution quality, and equity behavior in one screen.</span>
+          </div>
+        </div>
+        <div class="status-strip">
+          <div class="status-pill"><span class="status-dot" id="dot"></span><span id="last-update">Connecting...</span></div>
+          <div class="status-pill">Refresh <strong style="color:var(--text)">15s</strong></div>
+          <div class="status-pill">Mode <strong style="color:var(--text)">Live Monitor</strong></div>
+        </div>
+      </div>
+
+      <div class="content">
+        <section class="hero">
+          <div class="panel hero-main">
+            <div>
+              <div class="section-label">Execution cockpit</div>
+              <h1>Sharper signal, cleaner risk, better decisions.</h1>
+              <p>
+                A redesigned terminal that puts performance first: dominant PnL visibility, better chart framing,
+                cleaner market cards, and clearer readouts for setups, grades, and active exposure.
+              </p>
+            </div>
+            <div class="hero-rail">
+              <div class="rail-chip">
+                <span>Total Trades</span>
+                <strong id="hero-trades">0</strong>
+              </div>
+              <div class="rail-chip">
+                <span>Best Grade</span>
+                <strong id="hero-grade">No data</strong>
+              </div>
+              <div class="rail-chip">
+                <span>Active Positions</span>
+                <strong id="hero-positions">0 open</strong>
+              </div>
+              <div class="rail-chip">
+                <span>Live Status</span>
+                <strong id="hero-status">Syncing stream</strong>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel hero-side">
+            <div class="headline-stat">
+              <div class="metric-label">Win Rate</div>
+              <div class="metric-value" id="s-wr">-</div>
+              <div class="headline-sub" id="wr-caption">Waiting for fills</div>
+              <div class="headline-progress"><span id="wr-bar"></span></div>
+            </div>
+            <div class="headline-stat">
+              <div class="metric-label">Total PnL</div>
+              <div class="metric-value neutral" id="s-pnl">-</div>
+              <div class="headline-sub" id="pnl-caption">Net realized performance</div>
+            </div>
+            <div class="headline-stat">
+              <div class="metric-label">Profit Factor</div>
+              <div class="metric-value" id="s-pf">-</div>
+              <div class="headline-sub" id="pf-caption">Gross profit / gross loss</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="metrics-grid">
+          <div class="metric-card">
+            <div>
+              <div class="metric-label">Avg Win</div>
+              <div class="metric-value positive" id="s-aw">-</div>
+            </div>
+            <div class="metric-note">Average profit on winning trades.</div>
+          </div>
+          <div class="metric-card">
+            <div>
+              <div class="metric-label">Avg Loss</div>
+              <div class="metric-value negative" id="s-al">-</div>
+            </div>
+            <div class="metric-note">Average loss on closed losers.</div>
+          </div>
+          <div class="metric-card">
+            <div>
+              <div class="metric-label">Trade Count</div>
+              <div class="metric-value neutral" id="s-trades">-</div>
+            </div>
+            <div class="metric-note">Rolling count from trade history.</div>
+          </div>
+          <div class="metric-card">
+            <div>
+              <div class="metric-label">Open Positions</div>
+              <div class="metric-value neutral" id="s-open-positions">0</div>
+            </div>
+            <div class="metric-note">Currently active live positions.</div>
+          </div>
+        </section>
+
+        <section class="panel-block">
+          <div class="panel-head">
+            <div>
+              <span>Market overview</span>
+              <h2>Watchlist</h2>
+              <p>Clean price tiles with mark, funding, and open interest at a glance.</p>
+            </div>
+          </div>
+          <div class="market-grid" id="market-cards">
+            <div class="market-card"><div class="empty-state">Loading live prices...</div></div>
+          </div>
+        </section>
+
+        <section class="chart-grid">
+          <div class="chart-panel">
+            <div class="panel-head">
+              <div>
+                <span>Price action</span>
+                <h2>Multi-Asset Market Tape</h2>
+                <p>Cross-asset intraday movement for your tracked symbols.</p>
+              </div>
+            </div>
+            <div class="chart-wrap"><canvas id="market-chart"></canvas></div>
+          </div>
+
+          <div class="chart-panel">
+            <div class="panel-head">
+              <div>
+                <span>Performance</span>
+                <h2>Equity Curve</h2>
+                <p>Equity compression-free, with color tied to net trend.</p>
+              </div>
+            </div>
+            <div class="chart-wrap"><canvas id="equity-chart"></canvas></div>
+          </div>
+        </section>
+
+        <section class="table-panel">
+          <div class="panel-head">
+            <div>
+              <span>Exposure</span>
+              <h2>Open Positions</h2>
+              <p>Size, direction, current mark, and unrealized PnL.</p>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th><th>Mark</th><th>uPnL</th><th>Margin</th></tr></thead>
+              <tbody id="positions-body">
+                <tr><td colspan="7" class="empty-state">No open positions</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="analytics-grid">
+          <div class="analytics-panel">
+            <h3>Setup Performance</h3>
+            <div id="setup-stats"><div class="empty-state">No data yet</div></div>
+          </div>
+          <div class="analytics-panel">
+            <h3>Entry Grade Breakdown</h3>
+            <div id="grade-stats"><div class="empty-state">No data yet</div></div>
+          </div>
+        </section>
+
+        <section class="table-panel">
+          <div class="panel-head">
+            <div>
+              <span>Execution log</span>
+              <h2>Recent Trades</h2>
+              <p>Latest fills with side, setup, grade, and exit quality.</p>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Setup</th><th>Grade</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Reason</th></tr></thead>
+              <tbody id="trades-body">
+                <tr><td colspan="9" class="empty-state">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <div class="footer">
+          <div id="footer">Last updated: -</div>
+          <div>Delta dashboard visual refresh</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+
+Chart.defaults.color = '#8da2bc';
+Chart.defaults.borderColor = 'rgba(141, 162, 188, 0.08)';
+Chart.defaults.font.family = '"Sora", "Aptos", "Segoe UI", sans-serif';
+
+const marketPalette = ['#62c7ff', '#3ce6b0', '#ffbd5c', '#8f88ff', '#ff6b7a', '#7cf3d7'];
+
+const commonGrid = {
+  color: 'rgba(141, 162, 188, 0.08)',
+  drawBorder: false
+};
+
+const commonTicks = {
+  color: '#8da2bc',
+  font: { size: 10 }
+};
+
+const equityCtx = document.getElementById('equity-chart').getContext('2d');
+const equityChart = new Chart(equityCtx, {
+  type: 'line',
+  data: {
+    labels: [],
+    datasets: [{
+      label: 'Equity',
+      data: [],
+      borderColor: '#62c7ff',
+      backgroundColor: 'rgba(98,199,255,0.12)',
+      borderWidth: 2,
+      pointRadius: 0,
+      tension: 0.32,
+      fill: true
+    }]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: false,
+    interaction: { mode: 'index', intersect: false },
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        backgroundColor: 'rgba(9, 16, 27, 0.96)',
+        borderColor: 'rgba(141, 162, 188, 0.16)',
+        borderWidth: 1,
+        titleColor: '#f4f7fb',
+        bodyColor: '#c8d5e6',
+        padding: 12
+      }
+    },
+    scales: {
+      x: {
+        ticks: { ...commonTicks, maxTicksLimit: 6 },
+        grid: { display: false }
+      },
+      y: {
+        ticks: commonTicks,
+        grid: commonGrid
+      }
+    }
+  }
+});
+
+const marketCtx = document.getElementById('market-chart').getContext('2d');
+const marketChart = new Chart(marketCtx, {
+  type: 'line',
+  data: { labels: [], datasets: [] },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: false,
+    interaction: { mode: 'index', intersect: false },
+    plugins: {
+      legend: {
+        position: 'top',
+        align: 'end',
+        labels: {
+          color: '#8da2bc',
+          boxWidth: 12,
+          usePointStyle: true,
+          pointStyle: 'line',
+          padding: 18
+        }
+      },
+      tooltip: {
+        backgroundColor: 'rgba(9, 16, 27, 0.96)',
+        borderColor: 'rgba(141, 162, 188, 0.16)',
+        borderWidth: 1,
+        titleColor: '#f4f7fb',
+        bodyColor: '#c8d5e6',
+        padding: 12
+      }
+    },
+    scales: {
+      x: {
+        ticks: { ...commonTicks, maxTicksLimit: 7 },
+        grid: commonGrid
+      },
+      y: {
+        ticks: commonTicks,
+        grid: commonGrid
+      }
+    }
+  }
+});
+
+function num(value, digits = 2) {
+  return Number.parseFloat(value || 0).toFixed(digits);
+}
+
+function formatSigned(value, digits = 4) {
+  const n = Number.parseFloat(value || 0);
+  return `${n >= 0 ? '+' : ''}${n.toFixed(digits)}`;
+}
+
+function prettySetup(value) {
+  return String(value || '').replace(/_/g, ' ').trim() || 'Unknown';
+}
+
+function updateHeroStatus(text) {
+  document.getElementById('hero-status').textContent = text;
+}
+
+function updateEquity(labels, values) {
+  const n = Math.max(1, Math.floor(labels.length / 6));
+  equityChart.data.labels = labels.map((label, index) => index % n === 0 ? String(label).substring(0, 10) : '');
+  equityChart.data.datasets[0].data = values;
+
+  const start = Number(values[0] || 0);
+  const end = Number(values[values.length - 1] || 0);
+  const up = end >= start;
+  equityChart.data.datasets[0].borderColor = up ? '#3ce6b0' : '#ff6b7a';
+  equityChart.data.datasets[0].backgroundColor = up ? 'rgba(60,230,176,0.12)' : 'rgba(255,107,122,0.12)';
+  equityChart.update('none');
+}
+
+function updateMarketCards(items, errorMessage = '') {
+  const el = document.getElementById('market-cards');
+
+  if (errorMessage) {
+    el.innerHTML = `<div class="market-card"><div class="empty-state" style="color:var(--red)">${errorMessage}</div></div>`;
+    return;
+  }
+
+  if (!items || !items.length) {
+    el.innerHTML = '<div class="market-card"><div class="empty-state">No live market data</div></div>';
+    return;
+  }
+
+  el.innerHTML = items.map((ticker, index) => {
+    const funding = Number.parseFloat(ticker.funding_rate || 0);
+    const changeHint = funding >= 0 ? 'positive' : 'negative';
+    const symbol = ticker.symbol || `Asset ${index + 1}`;
+
+    return `
+      <article class="market-card">
+        <div class="market-top">
+          <div>
+            <div class="coin-symbol">${symbol}</div>
+            <div class="coin-sub">Mark ${num(ticker.mark_price, 2)}</div>
+          </div>
+          <div class="coin-tag">Live</div>
+        </div>
+        <div class="coin-price">${num(ticker.last_price, 2)}</div>
+        <div class="coin-strip">
+          <div class="coin-meta-box">
+            <span>Funding</span>
+            <strong class="${changeHint}">${num(funding, 5)}</strong>
+          </div>
+          <div class="coin-meta-box">
+            <span>Open Interest</span>
+            <strong>${Math.round(Number.parseFloat(ticker.open_interest || 0)).toLocaleString()}</strong>
+          </div>
+          <div class="coin-meta-box">
+            <span>Spread View</span>
+            <strong>${num(Number.parseFloat(ticker.last_price || 0) - Number.parseFloat(ticker.mark_price || 0), 2)}</strong>
+          </div>
+        </div>
+      </article>
+    `;
+  }).join('');
+}
+
+function updateMarketChart(payload) {
+  if (payload.error) {
+    marketChart.data.labels = [''];
+    marketChart.data.datasets = [{
+      label: payload.error,
+      data: [0],
+      borderColor: '#ff6b7a',
+      backgroundColor: 'rgba(255,107,122,0.15)',
+      borderWidth: 2,
+      pointRadius: 0,
+      tension: 0.3,
+      fill: false
+    }];
+    marketChart.update('none');
+    return;
+  }
+
+  marketChart.data.labels = payload.labels || [];
+  marketChart.data.datasets = (payload.datasets || []).map((dataset, index) => ({
+    label: dataset.label,
+    data: dataset.data,
+    borderColor: dataset.borderColor || marketPalette[index % marketPalette.length],
+    backgroundColor: (dataset.borderColor || marketPalette[index % marketPalette.length]) + '20',
+    borderWidth: 2,
+    pointRadius: 0,
+    pointHoverRadius: 3,
+    tension: 0.3,
+    fill: false
+  }));
+  marketChart.update('none');
+}
+
+function updatePositions(positions) {
+  const tbody = document.getElementById('positions-body');
+  const count = Array.isArray(positions) ? positions.length : 0;
+  document.getElementById('s-open-positions').textContent = count;
+  document.getElementById('hero-positions').textContent = `${count} open`;
+
+  if (!positions || !positions.length) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty-state">No open positions</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = positions.map(position => {
+    const pnl = Number.parseFloat(position.unrealized_pnl || 0);
+    const pnlClass = pnl >= 0 ? 'positive' : 'negative';
+    const side = ['long', 'short'].includes(String(position.side || '').toLowerCase()) ? String(position.side || '').toLowerCase() : 'long';
+    return `
+      <tr>
+        <td><strong>${position.symbol || ''}</strong></td>
+        <td><span class="tag tag-${side}">${side.toUpperCase()}</span></td>
+        <td>${num(position.size, 4)}</td>
+        <td>${num(position.entry_price, 2)}</td>
+        <td>${num(position.mark_price, 2)}</td>
+        <td class="${pnlClass}">${formatSigned(pnl, 4)}</td>
+        <td>${num(position.margin, 2)}</td>
+      </tr>
+    `;
+  }).join('');
+}
+
+function bestGrade(gradeStats) {
+  const order = ['A', 'B', 'C', 'D'];
+  const available = order.find(grade => gradeStats && gradeStats[grade] && Number(gradeStats[grade].trades || 0) > 0);
+  return available || 'No data';
+}
+
+function updateStats(stats) {
+  const pnl = Number.parseFloat(stats.total_pnl || 0);
+  const wr = Number.parseFloat(stats.win_rate || 0);
+  const pf = Number.parseFloat(stats.profit_factor || 0);
+  const avgWin = Number.parseFloat(stats.avg_win || 0);
+  const avgLoss = Number.parseFloat(stats.avg_loss || 0);
+
+  document.getElementById('s-pnl').textContent = formatSigned(pnl, 4);
+  document.getElementById('s-pnl').className = `metric-value ${pnl >= 0 ? 'positive' : 'negative'}`;
+  document.getElementById('s-trades').textContent = stats.total_trades || 0;
+  document.getElementById('hero-trades').textContent = stats.total_trades || 0;
+
+  document.getElementById('s-wr').textContent = `${wr.toFixed(1)}%`;
+  document.getElementById('s-wr').className = `metric-value ${wr >= 50 ? 'positive' : 'negative'}`;
+  document.getElementById('wr-caption').textContent = wr >= 50 ? 'Above the 50% threshold' : 'Below desired strike rate';
+  document.getElementById('wr-bar').style.width = `${Math.max(0, Math.min(100, wr))}%`;
+
+  document.getElementById('s-pf').textContent = pf.toFixed(2);
+  document.getElementById('s-pf').className = `metric-value ${pf >= 1 ? 'positive' : 'negative'}`;
+  document.getElementById('pf-caption').textContent = pf >= 1 ? 'Losses are covered by winners' : 'Winners are not covering losses';
+  document.getElementById('pnl-caption').textContent = pnl >= 0 ? 'Net realized performance is positive' : 'Net realized performance is under pressure';
+
+  document.getElementById('s-aw').textContent = formatSigned(avgWin, 4);
+  document.getElementById('s-al').textContent = avgLoss.toFixed(4);
+  document.getElementById('hero-grade').textContent = bestGrade(stats.grade_stats);
+
+  const setupStats = stats.setup_stats || {};
+  const setupEl = document.getElementById('setup-stats');
+  if (!Object.keys(setupStats).length) {
+    setupEl.innerHTML = '<div class="empty-state">No setup data yet</div>';
+  } else {
+    setupEl.innerHTML = Object.entries(setupStats).map(([setup, value]) => `
+      <div class="analytics-row">
+        <div class="analytics-name">${prettySetup(setup)}</div>
+        <div class="analytics-meta">${value.trades} trades • ${value.win_rate}% win rate</div>
+        <div class="analytics-pnl ${value.total_pnl >= 0 ? 'positive' : 'negative'}">${formatSigned(value.total_pnl, 3)}</div>
+      </div>
+    `).join('');
+  }
+
+  const gradeStats = stats.grade_stats || {};
+  const gradeEl = document.getElementById('grade-stats');
+  if (!Object.keys(gradeStats).length) {
+    gradeEl.innerHTML = '<div class="empty-state">No grade data yet</div>';
+  } else {
+    const gradeOrder = ['A', 'B', 'C', 'D'];
+    const sorted = gradeOrder.filter(grade => gradeStats[grade]).map(grade => [grade, gradeStats[grade]]);
+    gradeEl.innerHTML = sorted.map(([grade, value]) => `
+      <div class="analytics-row">
+        <div class="analytics-name"><span class="badge badge-${grade}">${grade}</span></div>
+        <div class="analytics-meta">${value.trades} trades • ${value.win_rate}% win rate</div>
+        <div class="analytics-pnl ${value.total_pnl >= 0 ? 'positive' : 'negative'}">${formatSigned(value.total_pnl, 3)}</div>
+      </div>
+    `).join('');
+  }
+}
+
+function updateTrades(trades) {
+  const tbody = document.getElementById('trades-body');
+
+  if (!trades || !trades.length) {
+    tbody.innerHTML = '<tr><td colspan="9" class="empty-state">No trades yet</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = [...trades].reverse().map(trade => {
+    const pnl = Number.parseFloat(trade.pnl || 0);
+    const pnlClass = pnl >= 0 ? 'positive' : 'negative';
+    const grade = String(trade.entry_grade || 'U').toUpperCase();
+    const gradeClass = ['A', 'B', 'C', 'D'].includes(grade) ? grade : 'U';
+    const side = ['long', 'short'].includes(String(trade.side || '').toLowerCase()) ? String(trade.side || '').toLowerCase() : 'long';
+    let reasonTag = trade.exit_reason || '-';
+    if (String(reasonTag).toLowerCase().includes('sl')) reasonTag = '<span class="tag tag-sl">SL</span>';
+    else if (String(reasonTag).toLowerCase().includes('tp')) reasonTag = '<span class="tag tag-tp">TP</span>';
+
+    return `
+      <tr>
+        <td style="color:var(--muted)">${trade.exit_time ? String(trade.exit_time).substring(0, 16) : '-'}</td>
+        <td><strong>${trade.symbol || ''}</strong></td>
+        <td><span class="tag tag-${side}">${side.toUpperCase()}</span></td>
+        <td style="color:var(--muted)">${prettySetup(trade.setup_type)}</td>
+        <td><span class="badge badge-${gradeClass}">${grade}</span></td>
+        <td>${num(trade.entry_price, 2)}</td>
+        <td>${trade.exit_price ? num(trade.exit_price, 2) : '-'}</td>
+        <td class="${pnlClass}">${formatSigned(pnl, 4)}</td>
+        <td>${reasonTag}</td>
+      </tr>
+    `;
+  }).join('');
+}
+
+async function refreshLivePanels() {
+  try {
+    const [marketRes, chartRes] = await Promise.all([
+      fetch('/api/market-overview' + (TOKEN ? '?token=' + TOKEN : '')),
+      fetch('/api/market-chart' + (TOKEN ? '?token=' + TOKEN : ''))
+    ]);
+
+    const market = await marketRes.json();
+    const chart = await chartRes.json();
+
+    updateMarketCards(market.tickers || [], market.error || '');
+    updatePositions(market.positions || []);
+    updateMarketChart(chart);
+
+    if (market.error || chart.error) {
+      document.getElementById('last-update').textContent = 'Live data unavailable';
+      updateHeroStatus('Market feed unavailable');
+    } else {
+      document.getElementById('last-update').textContent = 'Live market synced';
+      updateHeroStatus('Market and stream active');
+    }
+  } catch (error) {
+    console.error('Live panel refresh error', error);
+    updateMarketCards([], 'Live market fetch failed');
+    updateMarketChart({ error: 'Live market fetch failed' });
+    document.getElementById('last-update').textContent = 'Live data unavailable';
+    updateHeroStatus('Reconnect pending');
+  }
+}
+
+function connectSSE() {
+  const url = '/stream' + (TOKEN ? '?token=' + TOKEN : '');
+  const eventSource = new EventSource(url);
+
+  eventSource.onopen = () => {
+    document.getElementById('dot').style.background = 'var(--green)';
+    document.getElementById('last-update').textContent = 'Stream connected';
+    updateHeroStatus('Streaming fills and equity');
+  };
+
+  eventSource.onmessage = event => {
+    try {
+      const data = JSON.parse(event.data);
+      if (data.stats) updateStats(data.stats);
+      if (data.recent) updateTrades(data.recent);
+      if (data.equity && data.equity.labels) updateEquity(data.equity.labels, data.equity.values);
+      document.getElementById('footer').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+    } catch (error) {
+      console.error('SSE parse error', error);
+    }
+  };
+
+  eventSource.onerror = () => {
+    document.getElementById('dot').style.background = 'var(--red)';
+    document.getElementById('last-update').textContent = 'Reconnecting stream...';
+    updateHeroStatus('Stream reconnecting');
+    eventSource.close();
+    setTimeout(connectSSE, 5000);
+  };
+}
+
+async function initialLoad() {
+  try {
+    const [statsRes, tradesRes, equityRes] = await Promise.all([
+      fetch('/api/stats' + (TOKEN ? '?token=' + TOKEN : '')),
+      fetch('/api/trades?limit=100' + (TOKEN ? '&token=' + TOKEN : '')),
+      fetch('/api/equity' + (TOKEN ? '?token=' + TOKEN : ''))
+    ]);
+
+    const stats = await statsRes.json();
+    const trades = await tradesRes.json();
+    const equity = await equityRes.json();
+
+    updateStats(stats);
+    updateTrades(trades.trades || []);
+    if (equity.labels) updateEquity(equity.labels, equity.values);
+    await refreshLivePanels();
+  } catch (error) {
+    console.error('Initial load error', error);
+    updateHeroStatus('Initial sync failed');
+  }
+}
+
+initialLoad();
+connectSSE();
+setInterval(refreshLivePanels, 15000);
+</script>
+</body>
+</html>
