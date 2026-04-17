@@ -565,8 +565,8 @@ Backtest:
     t.add_argument("--slow-ema",         type=int,   default=50,    dest="slow_ema")
 
     tp = sub.add_parser("trade-portfolio", help="Run one shared-portfolio process across multiple symbols")
-    tp.add_argument("--symbols",          default="BTCUSD,ETHUSD,SOLUSD,BNBUSD,XRPUSD",
-                    help="Comma-separated symbol list, e.g. BTCUSD,ETHUSD,SOLUSD,BNBUSD,XRPUSD")
+    tp.add_argument("--symbols",          default="BTCUSD,ETHUSD,SOLUSD,BNBUSD,XRPUSD,AVAXUSD",
+                    help="Comma-separated symbol list, e.g. BTCUSD,ETHUSD,SOLUSD,BNBUSD,XRPUSD,AVAXUSD")
     tp.add_argument("--capital",          type=float, default=90.0,
                     help="Shared portfolio capital across all symbols in this process")
     tp.add_argument("--leverage",         type=int,   default=3)
