@@ -411,6 +411,160 @@
     letter-spacing: -0.06em;
   }
 
+  .coin-price-line {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 14px;
+    margin: 16px 0 12px;
+  }
+
+  .coin-price-line .coin-price {
+    margin: 0;
+  }
+
+  .coin-status-stack {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+
+  .coin-pill {
+    padding: 6px 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(255,255,255,0.08);
+    background: rgba(255,255,255,0.04);
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .pill-live,
+  .pill-bull,
+  .pill-ready,
+  .pill-signal,
+  .pill-ok {
+    color: var(--green);
+    border-color: rgba(60,230,176,0.24);
+    background: rgba(60,230,176,0.1);
+  }
+
+  .pill-bear,
+  .pill-hold,
+  .pill-blocked,
+  .pill-error {
+    color: var(--red);
+    border-color: rgba(255,107,122,0.24);
+    background: rgba(255,107,122,0.1);
+  }
+
+  .pill-neutral,
+  .pill-wait,
+  .pill-degraded {
+    color: var(--amber);
+    border-color: rgba(255,189,92,0.24);
+    background: rgba(255,189,92,0.1);
+  }
+
+  .coin-decision {
+    display: grid;
+    gap: 10px;
+    margin-bottom: 14px;
+  }
+
+  .coin-decision-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+  }
+
+  .coin-blockers {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .blocker-chip {
+    padding: 7px 10px;
+    border-radius: 12px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.06);
+    color: var(--muted);
+    font-size: 11px;
+  }
+
+  .confidence-track {
+    position: relative;
+    height: 8px;
+    border-radius: 999px;
+    overflow: hidden;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.06);
+  }
+
+  .confidence-fill {
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, var(--red), var(--amber), var(--green));
+  }
+
+  .execution-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+  }
+
+  .execution-panel {
+    padding: 20px;
+    border: 1px solid var(--line);
+    border-radius: 24px;
+    background: linear-gradient(180deg, rgba(12, 21, 35, 0.92), rgba(8, 16, 28, 0.96));
+  }
+
+  .execution-list {
+    display: grid;
+    gap: 12px;
+  }
+
+  .execution-row {
+    display: grid;
+    grid-template-columns: minmax(0, 120px) minmax(0, 1fr) auto;
+    gap: 12px;
+    align-items: center;
+    padding: 14px 16px;
+    border-radius: 18px;
+    border: 1px solid rgba(255,255,255,0.06);
+    background: rgba(255,255,255,0.03);
+  }
+
+  .execution-symbol {
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+  }
+
+  .execution-meta {
+    display: grid;
+    gap: 4px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .execution-state {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 96px;
+    padding: 8px 12px;
+    border-radius: 999px;
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    border: 1px solid rgba(255,255,255,0.08);
+  }
+
   .coin-strip {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -643,7 +797,8 @@
     .chart-grid,
     .analytics-grid,
     .market-grid,
-    .metrics-grid {
+    .metrics-grid,
+    .execution-grid {
       grid-template-columns: 1fr 1fr;
     }
 
@@ -666,7 +821,9 @@
     .metrics-grid,
     .chart-grid,
     .analytics-grid,
-    .hero-rail {
+    .hero-rail,
+    .execution-grid,
+    .coin-decision-grid {
       grid-template-columns: 1fr;
     }
 
@@ -799,11 +956,39 @@
             <div>
               <span>Market overview</span>
               <h2>Watchlist</h2>
-              <p>Clean price tiles with mark, funding, and open interest at a glance.</p>
+              <p>Execution-aware coin cards with HTF, confidence, blockers, and live trade context.</p>
             </div>
           </div>
           <div class="market-grid" id="market-cards">
             <div class="market-card"><div class="empty-state">Loading live prices...</div></div>
+          </div>
+        </section>
+
+        <section class="execution-grid">
+          <div class="execution-panel">
+            <div class="panel-head">
+              <div>
+                <span>Execution radar</span>
+                <h2>Decision Queue</h2>
+                <p>Per-coin scan of HTF alignment, action state, and latest decision timestamp.</p>
+              </div>
+            </div>
+            <div class="execution-list" id="execution-radar">
+              <div class="empty-state">Waiting for execution state...</div>
+            </div>
+          </div>
+
+          <div class="execution-panel">
+            <div class="panel-head">
+              <div>
+                <span>Blocker monitor</span>
+                <h2>Attention Board</h2>
+                <p>Fast view of what is stopping entries right now across the watchlist.</p>
+              </div>
+            </div>
+            <div class="execution-list" id="blocker-board">
+              <div class="empty-state">Waiting for blocker data...</div>
+            </div>
           </div>
         </section>
 
@@ -1006,6 +1191,29 @@ function prettySetup(value) {
   return String(value || '').replace(/_/g, ' ').trim() || 'Unknown';
 }
 
+function prettyLabel(value) {
+  return String(value || '-').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function decisionTone(item) {
+  if (item.active_trade) return 'live';
+  const type = String(item.decision?.event_type || '').toLowerCase();
+  if (type === 'signal') return 'ready';
+  if (type === 'hold') return 'hold';
+  return 'wait';
+}
+
+function statusTone(value) {
+  const text = String(value || '').toLowerCase();
+  if (['bull', 'live', 'ready', 'ok', 'signal', 'long'].includes(text)) return 'bull';
+  if (['bear', 'hold', 'blocked', 'error', 'short'].includes(text)) return 'bear';
+  return 'neutral';
+}
+
 function updateHeroStatus(text) {
   document.getElementById('hero-status').textContent = text;
 }
@@ -1026,7 +1234,7 @@ function updateEquity(labels, values) {
 function updateMarketCards(items, errorMessage = '') {
   const el = document.getElementById('market-cards');
 
-  if (errorMessage) {
+  if (errorMessage && (!items || !items.length)) {
     el.innerHTML = `<div class="market-card"><div class="empty-state" style="color:var(--red)">${errorMessage}</div></div>`;
     return;
   }
@@ -1036,21 +1244,63 @@ function updateMarketCards(items, errorMessage = '') {
     return;
   }
 
-  el.innerHTML = items.map((ticker, index) => {
+  el.innerHTML = items.map((item, index) => {
+    const ticker = item.ticker || item;
+    const decision = item.decision || {};
+    const blockers = Array.isArray(decision.blockers) ? decision.blockers.slice(0, 3) : [];
     const funding = Number.parseFloat(ticker.funding_rate || 0);
     const changeHint = funding >= 0 ? 'positive' : 'negative';
-    const symbol = ticker.symbol || `Asset ${index + 1}`;
+    const symbol = item.symbol || ticker.symbol || `Asset ${index + 1}`;
+    const confidence = clamp(Number.parseFloat(decision.confidence || 0) * 100, 0, 100);
+    const htf = String(decision.htf || '-').toLowerCase();
+    const regime = String(decision.regime || '-').toLowerCase();
+    const state = item.display_state || 'WAIT';
+    const stateTone = decisionTone(item);
+    const liveTag = item.active_trade ? `IN ${String(item.active_trade.side || 'trade').toUpperCase()}` : state;
+    const position = item.position || {};
+    const positionPnl = Number.parseFloat(position.unrealized_pnl || 0);
 
     return `
       <article class="market-card">
         <div class="market-top">
           <div>
             <div class="coin-symbol">${symbol}</div>
-            <div class="coin-sub">Mark ${num(ticker.mark_price, 2)}</div>
+            <div class="coin-sub">Updated ${item.updated_label || '-'} | Candle ${decision.candle_time || '-'}</div>
           </div>
-          <div class="coin-tag">Live</div>
+          <div class="coin-tag">${item.active_trade ? 'Active trade' : 'Watchlist'}</div>
         </div>
-        <div class="coin-price">${num(ticker.last_price, 2)}</div>
+        <div class="coin-price-line">
+          <div class="coin-price">${ticker.last_price ? num(ticker.last_price, 2) : '--'}</div>
+          <div class="coin-status-stack">
+            <span class="coin-pill pill-${stateTone}">${liveTag}</span>
+            <span class="coin-pill pill-${statusTone(htf)}">HTF ${prettyLabel(htf)}</span>
+            <span class="coin-pill pill-${statusTone(regime)}">${prettyLabel(regime)}</span>
+          </div>
+        </div>
+        <div class="coin-decision">
+          <div class="coin-decision-grid">
+            <div class="coin-meta-box">
+              <span>Confidence</span>
+              <strong>${confidence.toFixed(0)}%</strong>
+            </div>
+            <div class="coin-meta-box">
+              <span>RSI</span>
+              <strong>${decision.rsi !== undefined && decision.rsi !== '-' ? num(decision.rsi, 1) : '-'}</strong>
+            </div>
+            <div class="coin-meta-box">
+              <span>Exec State</span>
+              <strong>${prettyLabel(decision.event_type || item.latest_execution?.event_type || 'waiting')}</strong>
+            </div>
+            <div class="coin-meta-box">
+              <span>Live PnL</span>
+              <strong class="${positionPnl >= 0 ? 'positive' : 'negative'}">${item.position ? formatSigned(positionPnl, 4) : '-'}</strong>
+            </div>
+          </div>
+          <div class="confidence-track"><div class="confidence-fill" style="width:${confidence}%"></div></div>
+          <div class="coin-blockers">
+            ${blockers.length ? blockers.map(blocker => `<span class="blocker-chip">${prettyLabel(blocker)}</span>`).join('') : '<span class="blocker-chip positive">No active blockers</span>'}
+          </div>
+        </div>
         <div class="coin-strip">
           <div class="coin-meta-box">
             <span>Funding</span>
@@ -1062,10 +1312,56 @@ function updateMarketCards(items, errorMessage = '') {
           </div>
           <div class="coin-meta-box">
             <span>Spread View</span>
-            <strong>${num(Number.parseFloat(ticker.last_price || 0) - Number.parseFloat(ticker.mark_price || 0), 2)}</strong>
+            <strong>${ticker.last_price ? num(Number.parseFloat(ticker.last_price || 0) - Number.parseFloat(ticker.mark_price || 0), 2) : '-'}</strong>
           </div>
         </div>
       </article>
+    `;
+  }).join('');
+}
+
+function updateExecutionRadar(items) {
+  const radarEl = document.getElementById('execution-radar');
+  const blockerEl = document.getElementById('blocker-board');
+
+  if (!items || !items.length) {
+    radarEl.innerHTML = '<div class="empty-state">No execution state available</div>';
+    blockerEl.innerHTML = '<div class="empty-state">No blocker data available</div>';
+    return;
+  }
+
+  radarEl.innerHTML = items.map(item => {
+    const decision = item.decision || {};
+    const htf = prettyLabel(decision.htf || '-');
+    const regime = prettyLabel(decision.regime || '-');
+    const state = item.display_state || 'WAIT';
+    const tone = decisionTone(item);
+    const conf = clamp(Number.parseFloat(decision.confidence || 0) * 100, 0, 100);
+    return `
+      <div class="execution-row">
+        <div class="execution-symbol">${item.symbol}</div>
+        <div class="execution-meta">
+          <div>HTF ${htf} | Regime ${regime} | Confidence ${conf.toFixed(0)}%</div>
+          <div>${decision.candle_time || 'No decision candle'} | Last update ${item.updated_label || '-'}</div>
+        </div>
+        <div class="execution-state coin-pill pill-${tone}">${state}</div>
+      </div>
+    `;
+  }).join('');
+
+  blockerEl.innerHTML = items.map(item => {
+    const blockers = Array.isArray(item.decision?.blockers) ? item.decision.blockers : [];
+    const summary = blockers.length ? blockers.slice(0, 3).map(prettyLabel).join(' | ') : 'No blockers';
+    const tone = blockers.length ? 'bear' : 'bull';
+    return `
+      <div class="execution-row">
+        <div class="execution-symbol">${item.symbol}</div>
+        <div class="execution-meta">
+          <div>${summary}</div>
+          <div>${prettyLabel(item.decision?.event_type || 'waiting')} | HTF ${prettyLabel(item.decision?.htf || '-')}</div>
+        </div>
+        <div class="execution-state coin-pill pill-${tone}">${blockers.length ? blockers.length + ' blockers' : 'clear'}</div>
+      </div>
     `;
   }).join('');
 }
@@ -1237,21 +1533,28 @@ async function refreshLivePanels() {
 
     const market = await marketRes.json();
     const chart = await chartRes.json();
+    const watchlist = market.watchlist || market.tickers || [];
 
-    updateMarketCards(market.tickers || [], market.error || '');
+    updateMarketCards(watchlist, market.error || '');
+    updateExecutionRadar(watchlist);
     updatePositions(market.positions || []);
     updateMarketChart(chart);
 
     if (market.error || chart.error) {
       document.getElementById('last-update').textContent = 'Live data unavailable';
-      updateHeroStatus('Market feed unavailable');
+      updateHeroStatus(watchlist.length ? 'Decision feed active, market feed unavailable' : 'Market feed unavailable');
     } else {
       document.getElementById('last-update').textContent = 'Live market synced';
-      updateHeroStatus('Market and stream active');
+      const actionable = watchlist.filter(item => {
+        const state = String(item.display_state || '').toUpperCase();
+        return state.includes('IN ') || state.includes('SETUP') || state.includes('READY');
+      }).length;
+      updateHeroStatus(`${actionable} coins active or setup-ready`);
     }
   } catch (error) {
     console.error('Live panel refresh error', error);
     updateMarketCards([], 'Live market fetch failed');
+    updateExecutionRadar([]);
     updateMarketChart({ error: 'Live market fetch failed' });
     document.getElementById('last-update').textContent = 'Live data unavailable';
     updateHeroStatus('Reconnect pending');

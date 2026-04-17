@@ -13,16 +13,20 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+
+from delta_bot.config import StorageConfig
+from delta_bot.storage import AuditStore
 
 logger = logging.getLogger("dashboard")
 logging.basicConfig(level=logging.INFO)
@@ -71,6 +75,158 @@ def _load_equity() -> pd.DataFrame:
         return df
     except Exception:
         return pd.DataFrame()
+
+
+def _candidate_audit_db_paths() -> List[Path]:
+    cfg = StorageConfig(root=ROOT / ".bot_data")
+    candidates = [cfg.database_path]
+    bot_data = cfg.root
+    if bot_data.exists():
+        candidates.extend(sorted(bot_data.glob("system-recovery-*.db"), key=lambda p: p.stat().st_mtime, reverse=True))
+        candidates.extend(sorted(bot_data.glob("*.db"), key=lambda p: p.stat().st_mtime, reverse=True))
+
+    seen = set()
+    ordered: List[Path] = []
+    for path in candidates:
+        resolved = str(path.resolve())
+        if resolved in seen or not path.exists():
+            continue
+        seen.add(resolved)
+        ordered.append(path)
+    return ordered
+
+
+def _audit_db_score(path: Path) -> tuple:
+    try:
+        conn = sqlite3.connect(path, timeout=2)
+        cur = conn.cursor()
+        tables = {row[0] for row in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        required = {"audit_events", "runtime_state", "trade_audit"}
+        has_schema = int(required.issubset(tables))
+        if not has_schema:
+            return (0, 0, 0.0)
+        event_count = cur.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
+        runtime_count = cur.execute("SELECT COUNT(*) FROM runtime_state").fetchone()[0]
+        trade_count = cur.execute("SELECT COUNT(*) FROM trade_audit").fetchone()[0]
+        return (1, int(event_count + runtime_count + trade_count), path.stat().st_mtime)
+    except Exception:
+        return (0, 0, 0.0)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _load_audit_store() -> Optional[AuditStore]:
+    best_path: Optional[Path] = None
+    best_score = (-1, -1, -1.0)
+    for path in _candidate_audit_db_paths():
+        score = _audit_db_score(path)
+        if score > best_score:
+            best_score = score
+            best_path = path
+    if not best_path or best_score[0] <= 0:
+        return None
+    return AuditStore(best_path, config=StorageConfig(root=best_path.parent, database_name=best_path.name))
+
+
+def _compact_timestamp(value: str) -> str:
+    if not value:
+        return "-"
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%H:%M:%S")
+    except Exception:
+        return str(value)[:19]
+
+
+def _watchlist_runtime_snapshot(symbols: List[str]) -> Dict[str, dict]:
+    store = _load_audit_store()
+    snapshot: Dict[str, dict] = {symbol: {"symbol": symbol} for symbol in symbols}
+    if not store:
+        return snapshot
+
+    try:
+        runtime_items = store.list_runtime_states()
+        recent_events = store.recent_events(limit=max(200, len(symbols) * 30))
+    except Exception:
+        return snapshot
+
+    for item in runtime_items:
+        namespace = item.get("namespace")
+        state_key = item.get("state_key", "")
+        value = item.get("value", {}) or {}
+        symbol = str(value.get("symbol") or state_key.split(":")[-1] or "").upper()
+        if symbol not in snapshot:
+            continue
+        if namespace == "engine" and state_key.startswith("active_trade:"):
+            snapshot[symbol]["active_trade"] = {
+                "side": value.get("side", "-"),
+                "entry_price": value.get("entry_price"),
+                "stop_loss": value.get("stop_loss"),
+                "take_profit": value.get("take_profit"),
+                "trade_id": value.get("trade_id"),
+                "updated_at": value.get("updated_at") or item.get("updated_at"),
+            }
+        elif namespace == "monitoring":
+            snapshot[symbol]["monitoring"] = {
+                "component": value.get("component"),
+                "status": value.get("status", "unknown"),
+                "kind": value.get("kind"),
+                "message": value.get("message"),
+                "updated_at": item.get("updated_at"),
+            }
+
+    for event in recent_events:
+        symbol = str(event.get("symbol") or "").upper()
+        if symbol not in snapshot:
+            continue
+        payload = event.get("payload", {}) or {}
+        if event.get("category") == "decision" and "decision" not in snapshot[symbol]:
+            blockers = payload.get("blockers") or []
+            if isinstance(blockers, str):
+                blockers = [part.strip() for part in blockers.split(",") if part.strip()]
+            snapshot[symbol]["decision"] = {
+                "event_type": event.get("event_type", "-"),
+                "candle_time": payload.get("candle_time", "-"),
+                "price": payload.get("price"),
+                "regime": payload.get("regime", "-"),
+                "htf": payload.get("htf", "-"),
+                "rsi": payload.get("rsi", "-"),
+                "confidence": float(payload.get("confidence", 0.0) or 0.0),
+                "setup_type": payload.get("setup_type", "-"),
+                "entry_grade": payload.get("entry_grade", "-"),
+                "blockers": blockers[:6],
+                "updated_at": event.get("event_time"),
+            }
+        elif event.get("category") == "execution" and "latest_execution" not in snapshot[symbol]:
+            snapshot[symbol]["latest_execution"] = {
+                "event_type": event.get("event_type", "-"),
+                "severity": event.get("severity", "info"),
+                "updated_at": event.get("event_time"),
+            }
+
+    for symbol, item in snapshot.items():
+        decision = item.get("decision", {})
+        active_trade = item.get("active_trade")
+        monitoring = item.get("monitoring", {})
+        if active_trade:
+            state = f"IN {str(active_trade.get('side', 'trade')).upper()}"
+        elif decision.get("event_type") == "signal":
+            state = "READY"
+            grade = str(decision.get("entry_grade", "-")).upper()
+            if grade and grade != "-":
+                state = f"READY {grade}"
+        elif decision.get("event_type") == "hold":
+            state = "HOLD"
+        else:
+            state = "WAIT"
+        item["display_state"] = state
+        item["monitor_status"] = monitoring.get("status", "unknown")
+        item["updated_label"] = _compact_timestamp(
+            (decision.get("updated_at") or item.get("latest_execution", {}).get("updated_at") or monitoring.get("updated_at") or "")
+        )
+    return snapshot
 
 
 def _compute_stats(df: pd.DataFrame) -> dict:
@@ -188,8 +344,17 @@ async def api_market_overview(_ok: bool = Depends(_require_token)):
     key = os.getenv("DELTA_API_KEY", "").strip()
     secret = os.getenv("DELTA_API_SECRET", "").strip()
     symbols = _dashboard_symbols()
+    watchlist_state = _watchlist_runtime_snapshot(symbols)
     if not key or not secret:
-        return JSONResponse({"symbols": symbols, "tickers": [], "positions": [], "error": "API keys not configured"})
+        return JSONResponse(
+            {
+                "symbols": symbols,
+                "tickers": [],
+                "positions": [],
+                "watchlist": [watchlist_state[symbol] for symbol in symbols],
+                "error": "API keys not configured",
+            }
+        )
 
     from api import DeltaRESTClient
 
@@ -198,11 +363,24 @@ async def api_market_overview(_ok: bool = Depends(_require_token)):
             asyncio.gather(*(client.get_ticker(symbol) for symbol in symbols)),
             client.get_positions(),
         )
+
+    positions_by_symbol = {str(position.symbol).upper(): position.__dict__ for position in positions}
+    tickers_by_symbol = {str(ticker.symbol).upper(): ticker.__dict__ for ticker in tickers}
+    watchlist = [
+        {
+            **watchlist_state.get(symbol, {"symbol": symbol}),
+            "ticker": tickers_by_symbol.get(symbol, {"symbol": symbol}),
+            "position": positions_by_symbol.get(symbol),
+        }
+        for symbol in symbols
+    ]
+
     return JSONResponse(
         {
             "symbols": symbols,
             "tickers": [ticker.__dict__ for ticker in tickers],
             "positions": [position.__dict__ for position in positions],
+            "watchlist": watchlist,
             "updated_at": datetime.utcnow().isoformat(),
         }
     )
