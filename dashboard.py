@@ -23,7 +23,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 
 from delta_bot.config import StorageConfig
 from delta_bot.storage import AuditStore
@@ -34,6 +34,8 @@ logging.basicConfig(level=logging.INFO)
 ROOT = Path(__file__).parent
 TRADE_FILE = ROOT / "trade_history.csv"
 EQUITY_FILE = ROOT / "equity_curve.csv"
+FRONTEND_DIR = ROOT / "frontend"
+FRONTEND_DIST_DIR = FRONTEND_DIR / "dist"
 
 _file_lock = threading.Lock()
 
@@ -460,12 +462,43 @@ def stream(_ok: bool = Depends(_require_token)):
     return StreamingResponse(_sse_stream(), media_type="text/event-stream")
 
 
-DASHBOARD_HTML = (ROOT / "dashboard_template.html").read_text(encoding="utf-8")
+def _frontend_index_path() -> Optional[Path]:
+    index_path = FRONTEND_DIST_DIR / "index.html"
+    return index_path if index_path.exists() else None
+
+
+def _frontend_asset_path(asset_path: str) -> Optional[Path]:
+    candidate = (FRONTEND_DIST_DIR / "assets" / asset_path).resolve()
+    assets_root = (FRONTEND_DIST_DIR / "assets").resolve()
+    if not str(candidate).startswith(str(assets_root)) or not candidate.exists():
+        return None
+    return candidate
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard_ui(request: Request, _ok: bool = Depends(_require_token)):
-    return HTMLResponse(content=DASHBOARD_HTML)
+    index_path = _frontend_index_path()
+    if index_path:
+        return FileResponse(index_path)
+
+    fallback = """
+    <html>
+      <head><title>Dashboard Build Required</title></head>
+      <body style="font-family: Segoe UI, sans-serif; padding: 32px; background: #08111c; color: #f4f7fb;">
+        <h1>React dashboard is ready, but not built yet.</h1>
+        <p>Run <code>npm install</code> and <code>npm run build</code> inside <code>frontend/</code>, then reload <code>/dashboard</code>.</p>
+      </body>
+    </html>
+    """
+    return HTMLResponse(content=fallback)
+
+
+@app.get("/assets/{asset_path:path}")
+def dashboard_assets(asset_path: str, _ok: bool = Depends(_require_token)):
+    asset_file = _frontend_asset_path(asset_path)
+    if not asset_file:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    return FileResponse(asset_file)
 
 
 @app.get("/api/positions")
