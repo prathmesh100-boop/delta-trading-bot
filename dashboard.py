@@ -494,7 +494,7 @@ def dashboard_ui(request: Request, _ok: bool = Depends(_require_token)):
 
 
 @app.get("/assets/{asset_path:path}")
-def dashboard_assets(asset_path: str, _ok: bool = Depends(_require_token)):
+def dashboard_assets(asset_path: str):
     asset_file = _frontend_asset_path(asset_path)
     if not asset_file:
         raise HTTPException(status_code=404, detail="Asset not found")
