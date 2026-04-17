@@ -864,7 +864,7 @@
         </div>
         <div class="status-strip">
           <div class="status-pill"><span class="status-dot" id="dot"></span><span id="last-update">Connecting...</span></div>
-          <div class="status-pill">Refresh <strong style="color:var(--text)">15s</strong></div>
+          <div class="status-pill">Refresh <strong style="color:var(--text)">3s</strong></div>
           <div class="status-pill">Mode <strong style="color:var(--text)">Live Monitor</strong></div>
         </div>
       </div>
@@ -896,6 +896,14 @@
               <div class="rail-chip">
                 <span>Live Status</span>
                 <strong id="hero-status">Syncing stream</strong>
+              </div>
+              <div class="rail-chip">
+                <span>Wallet Balance</span>
+                <strong id="hero-wallet">-</strong>
+              </div>
+              <div class="rail-chip">
+                <span>Wallet Equity</span>
+                <strong id="hero-equity-live">-</strong>
               </div>
             </div>
           </div>
@@ -948,6 +956,13 @@
               <div class="metric-value neutral" id="s-open-positions">0</div>
             </div>
             <div class="metric-note">Currently active live positions.</div>
+          </div>
+          <div class="metric-card">
+            <div>
+              <div class="metric-label">Wallet Balance</div>
+              <div class="metric-value neutral" id="s-wallet-balance">-</div>
+            </div>
+            <div class="metric-note" id="wallet-asset-note">Live available wallet balance.</div>
           </div>
         </section>
 
@@ -1214,6 +1229,17 @@ function statusTone(value) {
   return 'neutral';
 }
 
+function updateAccount(account) {
+  const asset = String(account?.asset || 'USDT');
+  const balance = Number.parseFloat(account?.balance || 0);
+  const equity = Number.parseFloat(account?.equity || 0);
+
+  document.getElementById('s-wallet-balance').textContent = `${balance.toFixed(4)} ${asset}`;
+  document.getElementById('hero-wallet').textContent = `${balance.toFixed(4)} ${asset}`;
+  document.getElementById('hero-equity-live').textContent = `${equity.toFixed(4)} ${asset}`;
+  document.getElementById('wallet-asset-note').textContent = `Live available wallet balance in ${asset}.`;
+}
+
 function updateHeroStatus(text) {
   document.getElementById('hero-status').textContent = text;
 }
@@ -1270,7 +1296,7 @@ function updateMarketCards(items, errorMessage = '') {
           <div class="coin-tag">${item.active_trade ? 'Active trade' : 'Watchlist'}</div>
         </div>
         <div class="coin-price-line">
-          <div class="coin-price">${ticker.last_price ? num(ticker.last_price, 2) : '--'}</div>
+          <div class="coin-price">${ticker.last_price ? num(ticker.last_price, 4) : '--'}</div>
           <div class="coin-status-stack">
             <span class="coin-pill pill-${stateTone}">${liveTag}</span>
             <span class="coin-pill pill-${statusTone(htf)}">HTF ${prettyLabel(htf)}</span>
@@ -1304,15 +1330,15 @@ function updateMarketCards(items, errorMessage = '') {
         <div class="coin-strip">
           <div class="coin-meta-box">
             <span>Funding</span>
-            <strong class="${changeHint}">${num(funding, 5)}</strong>
+            <strong class="${changeHint}">${num(funding, 4)}</strong>
           </div>
           <div class="coin-meta-box">
             <span>Open Interest</span>
             <strong>${Math.round(Number.parseFloat(ticker.open_interest || 0)).toLocaleString()}</strong>
           </div>
           <div class="coin-meta-box">
-            <span>Spread View</span>
-            <strong>${ticker.last_price ? num(Number.parseFloat(ticker.last_price || 0) - Number.parseFloat(ticker.mark_price || 0), 2) : '-'}</strong>
+            <span>Mark / Spread</span>
+            <strong>${ticker.mark_price ? num(ticker.mark_price, 4) : '-'} / ${ticker.last_price ? num(Number.parseFloat(ticker.last_price || 0) - Number.parseFloat(ticker.mark_price || 0), 4) : '-'}</strong>
           </div>
         </div>
       </article>
@@ -1418,10 +1444,10 @@ function updatePositions(positions) {
         <td><strong>${position.symbol || ''}</strong></td>
         <td><span class="tag tag-${side}">${side.toUpperCase()}</span></td>
         <td>${num(position.size, 4)}</td>
-        <td>${num(position.entry_price, 2)}</td>
-        <td>${num(position.mark_price, 2)}</td>
+        <td>${num(position.entry_price, 4)}</td>
+        <td>${num(position.mark_price, 4)}</td>
         <td class="${pnlClass}">${formatSigned(pnl, 4)}</td>
-        <td>${num(position.margin, 2)}</td>
+        <td>${num(position.margin, 4)}</td>
       </tr>
     `;
   }).join('');
@@ -1515,8 +1541,8 @@ function updateTrades(trades) {
         <td><span class="tag tag-${side}">${side.toUpperCase()}</span></td>
         <td style="color:var(--muted)">${prettySetup(trade.setup_type)}</td>
         <td><span class="badge badge-${gradeClass}">${grade}</span></td>
-        <td>${num(trade.entry_price, 2)}</td>
-        <td>${trade.exit_price ? num(trade.exit_price, 2) : '-'}</td>
+        <td>${num(trade.entry_price, 4)}</td>
+        <td>${trade.exit_price ? num(trade.exit_price, 4) : '-'}</td>
         <td class="${pnlClass}">${formatSigned(pnl, 4)}</td>
         <td>${reasonTag}</td>
       </tr>
@@ -1538,6 +1564,7 @@ async function refreshLivePanels() {
     updateMarketCards(watchlist, market.error || '');
     updateExecutionRadar(watchlist);
     updatePositions(market.positions || []);
+    updateAccount(market.account || {});
     updateMarketChart(chart);
 
     if (market.error || chart.error) {
@@ -1616,7 +1643,7 @@ async function initialLoad() {
 
 initialLoad();
 connectSSE();
-setInterval(refreshLivePanels, 15000);
+setInterval(refreshLivePanels, 3000);
 </script>
 </body>
 </html>

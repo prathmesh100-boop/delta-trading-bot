@@ -359,9 +359,13 @@ async def api_market_overview(_ok: bool = Depends(_require_token)):
     from api import DeltaRESTClient
 
     async with DeltaRESTClient(key, secret) as client:
-        tickers, positions = await asyncio.gather(
+        product = await client.get_product(symbols[0]) if symbols else None
+        account_asset = DeltaRESTClient.infer_account_asset(product, symbols[0] if symbols else "")
+        tickers, positions, wallet_balance, wallet_equity = await asyncio.gather(
             asyncio.gather(*(client.get_ticker(symbol) for symbol in symbols)),
             client.get_positions(),
+            client.get_wallet_balance(account_asset),
+            client.get_account_equity(account_asset),
         )
 
     positions_by_symbol = {str(position.symbol).upper(): position.__dict__ for position in positions}
@@ -381,6 +385,11 @@ async def api_market_overview(_ok: bool = Depends(_require_token)):
             "tickers": [ticker.__dict__ for ticker in tickers],
             "positions": [position.__dict__ for position in positions],
             "watchlist": watchlist,
+            "account": {
+                "asset": account_asset,
+                "balance": round(float(wallet_balance or 0.0), 4),
+                "equity": round(float(wallet_equity or 0.0), 4),
+            },
             "updated_at": datetime.utcnow().isoformat(),
         }
     )
