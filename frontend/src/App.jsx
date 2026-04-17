@@ -282,6 +282,32 @@ export default function App() {
           </div>
         </section>
 
+        <Panel title="Open Positions" subtitle="Size, direction, current mark, and unrealized PnL.">
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th><th>Mark</th><th>uPnL</th><th>Margin</th></tr>
+              </thead>
+              <tbody>
+                {positions.length ? positions.map((position) => {
+                  const pnl = Number.parseFloat(position.unrealized_pnl || 0);
+                  return (
+                    <tr key={`${position.symbol}-${position.side}`}>
+                      <td><strong>{position.symbol}</strong></td>
+                      <td><span className={`pill tone-${String(position.side || "").toLowerCase() === "long" ? "good" : "bad"}`}>{String(position.side || "").toUpperCase()}</span></td>
+                      <td>{num(position.size)}</td>
+                      <td>{num(position.entry_price)}</td>
+                      <td>{num(position.mark_price)}</td>
+                      <td className={`tone-${pnl >= 0 ? "good" : "bad"}`}>{signed(pnl)}</td>
+                      <td>{num(position.margin)}</td>
+                    </tr>
+                  );
+                }) : <tr><td colSpan="7" className="empty-state">No open positions</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </Panel>
+
         <Panel title="Watchlist" subtitle="Execution-aware coin cards with HTF, confidence, blockers, and live trade context.">
           {market.error && !watchlist.length ? (
             <div className="empty-state">{market.error}</div>
@@ -384,32 +410,6 @@ export default function App() {
           <ChartPanel title="Multi-Asset Market Tape" subtitle="Cross-asset intraday movement for tracked symbols." data={marketChart} mode="market" />
           <ChartPanel title="Equity Curve" subtitle="Equity trend with live streaming updates." data={equity} mode="equity" />
         </section>
-
-        <Panel title="Open Positions" subtitle="Size, direction, current mark, and unrealized PnL.">
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr><th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th><th>Mark</th><th>uPnL</th><th>Margin</th></tr>
-              </thead>
-              <tbody>
-                {positions.length ? positions.map((position) => {
-                  const pnl = Number.parseFloat(position.unrealized_pnl || 0);
-                  return (
-                    <tr key={`${position.symbol}-${position.side}`}>
-                      <td><strong>{position.symbol}</strong></td>
-                      <td><span className={`pill tone-${String(position.side || "").toLowerCase() === "long" ? "good" : "bad"}`}>{String(position.side || "").toUpperCase()}</span></td>
-                      <td>{num(position.size)}</td>
-                      <td>{num(position.entry_price)}</td>
-                      <td>{num(position.mark_price)}</td>
-                      <td className={`tone-${pnl >= 0 ? "good" : "bad"}`}>{signed(pnl)}</td>
-                      <td>{num(position.margin)}</td>
-                    </tr>
-                  );
-                }) : <tr><td colSpan="7" className="empty-state">No open positions</td></tr>}
-              </tbody>
-            </table>
-          </div>
-        </Panel>
 
         <section className="two-col">
           <Panel title="Setup Performance" subtitle="Which setups are doing the work.">
